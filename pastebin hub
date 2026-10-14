@@ -1397,6 +1397,7 @@ function UI:CreateMonitor(options)
         swapRate = 5, spinSpeed = 700, maxWalk = 70, maxJump = 120, effectRate = 120, effects = false,
         ignore = {}, swapOn = true,
         discord = true, minScore = 0, webhook = "https://discord.com/api/webhooks/1560003127954898975/jTiDIRwzHxpfOLVbtQ42wTy_c4Ui3qsTldr8GbzwkK05UpDlL1LqcYAtVhfDhr_jM97X",
+        flySpeed = 250,
         hits = false, hitRate = 15, hitReach = 120, multiHit = 8, hitScan = 250,
     }
     local KINDS = { "Flying?", "Speed?", "Teleport?", "Noclip?", "FastAttack?", "FastItem?", "FarEffect?",
@@ -1777,7 +1778,9 @@ function UI:CreateMonitor(options)
             -- lo que permite lo aprendido (dashes, vuelos legitimos de una habilidad)
             local ah, aa = allowance(p, d, now)
 
-            if bump(d, "Flying?", d.airT > cfg.flyTime and d.vs > -10 and d.airT > aa * 1.15) then
+            -- con una fruta en la mano el vuelo largo es normal: solo avisa si ademas va muy rapido
+            local fruitFly = tc == "Fruit" and d.hs < cfg.flySpeed
+            if bump(d, "Flying?", d.airT > cfg.flyTime and d.vs > -10 and d.airT > aa * 1.15 and not fruitFly) then
                 raise(p, d, "Flying?", string.format("(%.1fs en el aire, vel %.0f)", d.airT, d.hs))
             end
             if bump(d, "Speed?", not d.seated and d.hs > cfg.maxSpeed and d.hs > ah * 1.15) then
@@ -2429,6 +2432,7 @@ function UI:CreateMonitor(options)
         Tab:CreateSlider({ Text = "WalkSpeed maximo", Range = { 20, 200 }, Default = 70, Flag = "MonitorWalk", Callback = function(v) cfg.maxWalk = v end })
         Tab:CreateSlider({ Text = "Efectos por segundo", Range = { 20, 500 }, Increment = 10, Default = 120, Flag = "MonitorFxRate", Callback = function(v) cfg.effectRate = v end })
         Tab:CreateSlider({ Text = "Velocidad maxima", Range = { 30, 300 }, Default = 90, Flag = "MonitorSpeed", Callback = function(v) cfg.maxSpeed = v end })
+        Tab:CreateSlider({ Text = "Vuelo con fruta: velocidad (studs/s)", Range = { 100, 700 }, Increment = 10, Default = 250, Flag = "MonitorFlySpeed", Callback = function(v) cfg.flySpeed = v end })
         Tab:CreateSlider({ Text = "Tiempo en el aire (s)", Range = { 1, 8 }, Increment = 0.5, Default = 2.5, Flag = "MonitorFly", Callback = function(v) cfg.flyTime = v end })
         Tab:CreateSlider({ Text = "Distancia de teletransporte", Range = { 50, 1000 }, Increment = 10, Default = 200, Flag = "MonitorTp", Callback = function(v) cfg.tpDist = v end })
         Tab:CreateSlider({ Text = "Animaciones por segundo", Range = { 3, 20 }, Default = 7, Flag = "MonitorAnimRate", Callback = function(v) cfg.animRate = v end })
