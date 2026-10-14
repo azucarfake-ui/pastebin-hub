@@ -1394,8 +1394,14 @@ function UI:CreateMonitor(options)
         on = false, notify = true, tags = false, learn = false, far = false, noclip = true,
         maxSpeed = 90, flyTime = 2.5, tpDist = 200, step = 0.2,
         animRate = 7, animRepeat = 5, paceFactor = 0.6, farDist = 600,
+        swapRate = 5, spinSpeed = 700, maxWalk = 70, maxJump = 120, effectRate = 120, effects = false,
+        ignore = {}, swapOn = true,
     }
-    local KINDS = { "Flying?", "Speed?", "Teleport?", "Noclip?", "FastAttack?", "FastItem?", "FarEffect?" }
+    local KINDS = { "Flying?", "Speed?", "Teleport?", "Noclip?", "FastAttack?", "FastItem?", "FarEffect?",
+        "SwapSpam?", "Spin?", "Stats?", "EffectSpam?" }
+    -- cuanto pesa cada aviso en la nota de sospecha (0-100)
+    local WEIGHT = { ["Flying?"] = 12, ["Speed?"] = 10, ["Teleport?"] = 14, ["Noclip?"] = 10, ["FastAttack?"] = 12,
+        ["FastItem?"] = 12, ["FarEffect?"] = 8, ["SwapSpam?"] = 10, ["Spin?"] = 8, ["Stats?"] = 14, ["EffectSpam?"] = 8 }
 
     local data = {}                 -- [player] = estado
     local log = {}                  -- ultimos avisos
@@ -1423,6 +1429,8 @@ function UI:CreateMonitor(options)
                 score = {}, flash = {}, lastNotify = {}, airT = 0, hs = 0, vs = 0, rate = 0,
                 status = "-", anims = {}, lastStart = {}, pace = {},
                 peakHs = 0, peakVs = 0, peakRate = 0, peakTool = "-", attacks = 0, fastFlags = 0, tools = {}, events = {},
+                uses = {}, counts = {}, swaps = {}, held = nil, swapN = 0, spin = 0, peakSpin = 0, look = nil,
+                fx = {}, fxRate = 0, peakFx = 0, lastFx = nil, since = os.clock(), peakWalk = 0,
                 seen = setmetatable({}, { __mode = "k" }),
             }
             data[p] = d
@@ -1521,6 +1529,7 @@ function UI:CreateMonitor(options)
             local tn, tc = heldTool(p.Character)
             local full = detail .. " | pos " .. fmtPos(hrp and hrp.Position) .. (tn and (" | " .. tc .. ": " .. tn) or "")
             if kind == "FastAttack?" or kind == "FastItem?" then d.fastFlags = d.fastFlags + 1 end
+            d.counts[kind] = (d.counts[kind] or 0) + 1
             addLog(p.Name, kind, full)
             d.events[#d.events + 1] = { t = os.date("%H:%M:%S"), kind = kind, detail = full }
             if #d.events > 8 then table.remove(d.events, 1) end
@@ -1623,6 +1632,10 @@ function UI:CreateMonitor(options)
         local now = os.clock()
         d.anims[#d.anims + 1] = { t = now, id = id }
         d.attacks = d.attacks + 1
+        do
+            local un = toolName(p.Character)
+            d.uses[un] = (d.uses[un] or 0) + 1
+        end
         while d.anims[1] and now - d.anims[1].t > 3 do table.remove(d.anims, 1) end
         recentCasts[p] = now
 
@@ -1716,7 +1729,9 @@ function UI:CreateMonitor(options)
         -- personaje nuevo (reaparecio): empezar de cero y dar 3 s de margen
         if d.char ~= char then
             d.char, d.last, d.airT, d.grace = char, nil, 0, now + 3
-            d.peakHs, d.peakVs, d.peakRate = 0, 0, 0
+            d.peakHs, d.peakVs, d.peakRate, d.peakSpin, d.peakFx = 0, 0, 0, 0, 0
+            d.look, d.held = nil, nil
+            table.clear(d.swaps); table.clear(d.fx)
             table.clear(d.score); table.clear(d.flash); table.clear(d.anims); table.clear(d.pace)
         end
 
@@ -1769,6 +1784,53 @@ function UI:CreateMonitor(options)
                     end
                 end
                 if bump(d, "Noclip?", inside) then raise(p, d, "Noclip?", "(dentro de una pieza solida)") end
+            end
+
+            -- cambios de item muy seguidos (los fast attack suelen alternar herramientas)
+            if tn ~= d.held then
+                if d.held ~= nil then d.swaps[#d.swaps + 1] = now end
+                d.held = tn
+            end
+            while d.swaps[1] and now - d.swaps[1] > 2 do table.remove(d.swaps, 1) end
+            d.swapN = #d.swaps
+            if bump(d, "SwapSpam?", cfg.swapOn and d.swapN >= cfg.swapRate) then
+                raise(p, d, "SwapSpam?", string.format("(%d cambios de item en 2s)", d.swapN))
+            end
+
+            -- giros: cambio de direccion por segundo
+            local lv = hrp.CFrame.LookVector
+            if d.look and dt > 0 then
+                local flat, prevFlat = Vector3.new(lv.X, 0, lv.Z), Vector3.new(d.look.X, 0, d.look.Z)
+                if flat.Magnitude > 0.01 and prevFlat.Magnitude > 0.01 then
+                    local dot = math.clamp(flat.Unit:Dot(prevFlat.Unit), -1, 1)
+                    d.spin = math.deg(math.acos(dot)) / dt
+                    d.peakSpin = math.max(d.peakSpin, d.spin)
+                end
+            end
+            d.look = lv
+            if bump(d, "Spin?", not d.seated and d.spin > cfg.spinSpeed) then
+                raise(p, d, "Spin?", string.format("(%.0f grados/s)", d.spin))
+            end
+
+            -- WalkSpeed y salto fuera de lo normal
+            local okS, ws = pcall(function() return hum.WalkSpeed end)
+            local okJ, jp = pcall(function() return hum.UseJumpPower and hum.JumpPower or hum.JumpHeight * 7 end)
+            if okS then d.peakWalk = math.max(d.peakWalk, ws) end
+            if bump(d, "Stats?", (okS and ws > cfg.maxWalk) or (okJ and jp > cfg.maxJump)) then
+                raise(p, d, "Stats?", string.format("(WalkSpeed %.0f, salto %.0f)", okS and ws or 0, okJ and jp or 0))
+            end
+
+            -- efectos por segundo (solo si el modulo esta encendido)
+            if cfg.effects then
+                local n = 0
+                for i = #d.fx, 1, -1 do
+                    if now - d.fx[i] <= 1 then n = n + 1 else table.remove(d.fx, i) end
+                end
+                d.fxRate = n
+                d.peakFx = math.max(d.peakFx, n)
+                if bump(d, "EffectSpam?", n > cfg.effectRate) then
+                    raise(p, d, "EffectSpam?", string.format("(%d efectos/s cerca de %s)", n, fmtPos(d.lastFx)))
+                end
             end
 
             -- ritmo de animaciones de accion
@@ -1862,7 +1924,7 @@ function UI:CreateMonitor(options)
             if cfg.learn then pcall(learnTick, now, filter) end
             if cfg.on then
                 for _, p in ipairs(Players:GetPlayers()) do
-                    if p ~= lp then pcall(check, p, getData(p), now, filter) end
+                    if p ~= lp and not cfg.ignore[p.Name] then pcall(check, p, getData(p), now, filter) end
                 end
             end
             task.wait(cfg.step)
@@ -1920,6 +1982,62 @@ function UI:CreateMonitor(options)
         end)
     end
 
+    -- efectos: cuenta piezas y particulas nuevas y las asigna al jugador que lanzo algo hace poco y esta mas cerca
+    local fxConn
+    local function setEffects(on)
+        if fxConn then fxConn:Disconnect() fxConn = nil end
+        if not on then return end
+        fxConn = workspace.DescendantAdded:Connect(function(o)
+            if not (cfg.on and cfg.effects) or next(recentCasts) == nil then return end
+            if not (o:IsA("BasePart") or o:IsA("ParticleEmitter")) then return end
+            local now = os.clock()
+            local pos = o:IsA("BasePart") and o.Position or (o.Parent and o.Parent:IsA("BasePart") and o.Parent.Position)
+            if not pos then return end
+            local best, bestD
+            for p, t in pairs(recentCasts) do
+                if now - t > 1.2 then
+                    recentCasts[p] = nil
+                else
+                    local hrp = p.Character and p.Character:FindFirstChild("HumanoidRootPart")
+                    if hrp and not o:IsDescendantOf(p.Character) then
+                        local dist = (pos - hrp.Position).Magnitude
+                        if not bestD or dist < bestD then best, bestD = p, dist end
+                    end
+                end
+            end
+            local d = best and data[best]
+            if d then
+                d.fx[#d.fx + 1] = now
+                d.lastFx = pos
+            end
+        end)
+    end
+    table.insert(conns, { Disconnect = function() if fxConn then fxConn:Disconnect() fxConn = nil end end })
+
+    -- nota de sospecha 0-100 segun cuantos avisos acumulo y de que tipo
+    local function suspicion(d)
+        local total = 0
+        for kind, n in pairs(d.counts) do total = total + (WEIGHT[kind] or 8) * math.min(n, 5) end
+        return math.min(100, total)
+    end
+
+    local function topUses(d)
+        local arr = {}
+        for n, c in pairs(d.uses) do arr[#arr + 1] = { n, c } end
+        table.sort(arr, function(a, b) return a[2] > b[2] end)
+        local out = {}
+        for i = 1, math.min(4, #arr) do out[i] = arr[i][1] .. " x" .. arr[i][2] end
+        return #out > 0 and table.concat(out, ", ") or "sin usos"
+    end
+
+    local function countsLine(d)
+        local out = {}
+        for _, k in ipairs(KINDS) do
+            if d.counts[k] then out[#out + 1] = k .. " x" .. d.counts[k] end
+        end
+        return #out > 0 and table.concat(out, ", ") or "ninguno"
+    end
+
     -- ---------------------------------------------------------
     --  reportes
     -- ---------------------------------------------------------
@@ -1963,6 +2081,11 @@ function UI:CreateMonitor(options)
             string.format("Aire: %.1fs | Vida: %s", d.airT, hum and string.format("%.0f/%.0f", hum.Health, hum.MaxHealth) or "?"),
             string.format("Ataques: %d total | %d/s ahora | pico %d/s (%s) | alertas de fast attack: %d",
                 d.attacks, d.rate or 0, d.peakRate, d.peakTool, d.fastFlags),
+            "Mas usados: " .. topUses(d),
+            string.format("Giro: %.0f grados/s (pico %.0f) | cambios de item 2s: %d | WalkSpeed pico %.0f",
+                d.spin, d.peakSpin, d.swapN, d.peakWalk),
+            cfg.effects and string.format("Efectos: %d/s (pico %d) | ultimo en %s", d.fxRate, d.peakFx, fmtPos(d.lastFx)) or "Efectos: modulo apagado",
+            string.format("Sospecha %d/100 | avisos: %s | observado %.0f s", suspicion(d), countsLine(d), os.clock() - d.since),
         }
         if #d.events > 0 then
             lines[#lines + 1] = "Ultimos avisos:"
@@ -1974,15 +2097,38 @@ function UI:CreateMonitor(options)
         return table.concat(lines, "\n")
     end
 
+    local function reportText()
+        local parts = {}
+        for p, d in pairs(data) do parts[#parts + 1] = { suspicion(d), dossier(p, d) } end
+        table.sort(parts, function(a, b) return a[1] > b[1] end)
+        local out = {}
+        for i, e in ipairs(parts) do out[i] = e[2] end
+        if #out == 0 then return "Sin datos todavia: enciende el Monitor y espera unos segundos." end
+        return table.concat(out, "\n\n")
+    end
+
     local function report()
         print("---- Player Monitor ----")
-        local n = 0
-        for p, d in pairs(data) do
-            n = n + 1
-            print(dossier(p, d))
-            print("")
-        end
-        if n == 0 then print("Sin datos todavia: enciende el Monitor y espera unos segundos.") end
+        print(reportText())
+    end
+
+    local function fullText()
+        local lines = { reportText(), "", "---- Registro de avisos ----" }
+        for _, e in ipairs(log) do lines[#lines + 1] = string.format("[%s] %s %s %s", e.t, e.name, e.kind, e.detail) end
+        return table.concat(lines, "\n")
+    end
+
+    local function saveReport()
+        if typeof(writefile) ~= "function" then say("Monitor", "Tu ejecutor no tiene writefile") return end
+        if typeof(isfolder) == "function" and typeof(makefolder) == "function" and not isfolder(FOLDER) then pcall(makefolder, FOLDER) end
+        local path = FOLDER .. "/reporte_" .. os.date("%Y%m%d_%H%M%S") .. ".txt"
+        if pcall(writefile, path, fullText()) then say("Monitor", "Guardado en " .. path) else say("Monitor", "No se pudo guardar") end
+    end
+
+    local function copyReport()
+        if typeof(setclipboard) ~= "function" then say("Monitor", "Tu ejecutor no tiene setclipboard") return end
+        pcall(setclipboard, fullText())
+        say("Monitor", "Reporte copiado")
     end
 
     local function printLog()
@@ -1994,9 +2140,12 @@ function UI:CreateMonitor(options)
     local function flaggedText()
         local out = {}
         for p, d in pairs(data) do
-            if d.status ~= "-" and d.status ~= "OK" then out[#out + 1] = p.Name .. ": " .. d.status end
+            if d.status ~= "-" and d.status ~= "OK" and not cfg.ignore[p.Name] then
+                out[#out + 1] = { suspicion(d), p.Name .. " [" .. suspicion(d) .. "]: " .. d.status }
+            end
         end
-        table.sort(out)
+        table.sort(out, function(a, b) return a[1] > b[1] end)
+        for i, e in ipairs(out) do out[i] = e[2] end
         if #out == 0 then return "Nadie marcado" end
         if #out > 6 then out = { table.unpack(out, 1, 6) } end
         return table.concat(out, "\n")
@@ -2010,7 +2159,7 @@ function UI:CreateMonitor(options)
     _G.PlayerMonitor = { Data = data, Learned = learned, Config = cfg, Log = log, Report = report }
     _G.__PlayerMonitorStop = function()
         alive = false
-        cfg.on, cfg.learn, cfg.far = false, false, false
+        cfg.on, cfg.learn, cfg.far, cfg.effects = false, false, false, false
         gen = gen + 1
         if farConn then farConn:Disconnect() farConn = nil end
         if selfConn then selfConn:Disconnect() selfConn = nil end
@@ -2066,7 +2215,17 @@ function UI:CreateMonitor(options)
             Callback = function(v) cfg.far = v setFar(v) end,
         })
 
+        Tab:CreateToggle({ Text = "Detectar cambios de item", Default = true, Flag = "MonitorSwap", Callback = function(v) cfg.swapOn = v end })
+        Tab:CreateToggle({
+            Text = "Contar efectos (experimental)", Default = false, Flag = "MonitorEffects",
+            Callback = function(v) cfg.effects = v setEffects(v) end,
+        })
+
         section("Limites")
+        Tab:CreateSlider({ Text = "Cambios de item en 2s", Range = { 2, 12 }, Default = 5, Flag = "MonitorSwapRate", Callback = function(v) cfg.swapRate = v end })
+        Tab:CreateSlider({ Text = "Giro maximo (grados/s)", Range = { 300, 2000 }, Increment = 50, Default = 700, Flag = "MonitorSpin", Callback = function(v) cfg.spinSpeed = v end })
+        Tab:CreateSlider({ Text = "WalkSpeed maximo", Range = { 20, 200 }, Default = 70, Flag = "MonitorWalk", Callback = function(v) cfg.maxWalk = v end })
+        Tab:CreateSlider({ Text = "Efectos por segundo", Range = { 20, 500 }, Increment = 10, Default = 120, Flag = "MonitorFxRate", Callback = function(v) cfg.effectRate = v end })
         Tab:CreateSlider({ Text = "Velocidad maxima", Range = { 30, 300 }, Default = 90, Flag = "MonitorSpeed", Callback = function(v) cfg.maxSpeed = v end })
         Tab:CreateSlider({ Text = "Tiempo en el aire (s)", Range = { 1, 8 }, Increment = 0.5, Default = 2.5, Flag = "MonitorFly", Callback = function(v) cfg.flyTime = v end })
         Tab:CreateSlider({ Text = "Distancia de teletransporte", Range = { 50, 1000 }, Increment = 10, Default = 200, Flag = "MonitorTp", Callback = function(v) cfg.tpDist = v end })
@@ -2096,6 +2255,28 @@ function UI:CreateMonitor(options)
         section("Registro")
         Tab:CreateButton({ Text = "Imprimir reporte (F9)", Callback = report })
         Tab:CreateButton({ Text = "Imprimir registro (F9)", Callback = printLog })
+        Tab:CreateButton({ Text = "Guardar reporte (archivo)", Callback = saveReport })
+        Tab:CreateButton({ Text = "Copiar reporte", Callback = copyReport })
+        Tab:CreateButton({
+            Text = "Ignorar / vigilar jugador elegido",
+            Callback = function()
+                local name = PlayerDD and PlayerDD.Value
+                if not name or name == "(nadie)" then return end
+                cfg.ignore[name] = not cfg.ignore[name] or nil
+                say("Monitor", name .. (cfg.ignore[name] and " ignorado" or " vigilado otra vez"))
+            end,
+        })
+        Tab:CreateButton({
+            Text = "Borrar historial de todos",
+            Callback = function()
+                for p, d in pairs(data) do
+                    d.counts, d.events, d.tools, d.uses = {}, {}, {}, {}
+                    d.attacks, d.fastFlags, d.peakHs, d.peakVs, d.peakRate, d.peakSpin, d.peakFx = 0, 0, 0, 0, 0, 0, 0
+                end
+                table.clear(log)
+                say("Monitor", "Historial borrado")
+            end,
+        })
 
         -- refresca los textos una vez por segundo
         task.spawn(function()
