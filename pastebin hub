@@ -1395,7 +1395,7 @@ function UI:CreateMonitor(options)
         maxSpeed = 90, flyTime = 2.5, tpDist = 200, step = 0.2,
         animRate = 7, animRepeat = 5, paceFactor = 0.6, farDist = 600,
     }
-    local KINDS = { "Flying?", "Speed?", "Teleport?", "Noclip?", "FastAnim?", "FastItem?", "FarEffect?" }
+    local KINDS = { "Flying?", "Speed?", "Teleport?", "Noclip?", "FastAttack?", "FastItem?", "FarEffect?" }
 
     local data = {}                 -- [player] = estado
     local log = {}                  -- ultimos avisos
@@ -1416,17 +1416,13 @@ function UI:CreateMonitor(options)
         end
     end
 
-    local function addLog(name, kind, detail)
-        log[#log + 1] = { t = os.date("%H:%M:%S"), name = name, kind = kind, detail = detail }
-        if #log > 100 then table.remove(log, 1) end
-    end
-
     local function getData(p)
         local d = data[p]
         if not d then
             d = {
                 score = {}, flash = {}, lastNotify = {}, airT = 0, hs = 0, vs = 0, rate = 0,
                 status = "-", anims = {}, lastStart = {}, pace = {},
+                peakHs = 0, peakVs = 0, peakRate = 0, peakTool = "-", attacks = 0, fastFlags = 0, tools = {}, events = {},
                 seen = setmetatable({}, { __mode = "k" }),
             }
             data[p] = d
@@ -1440,16 +1436,6 @@ function UI:CreateMonitor(options)
         if cond then s = math.min(s + 1, 10) else s = math.max(s - 0.5, 0) end
         d.score[kind] = s
         return s >= 5
-    end
-
-    local function raise(p, d, kind, detail)
-        local now = os.clock()
-        d.flash[kind] = now + 4
-        if now - (d.lastNotify[kind] or -99) > 15 then
-            d.lastNotify[kind] = now
-            addLog(p.Name, kind, detail)
-            if cfg.notify then say(p.Name, kind .. " " .. detail) end
-        end
     end
 
     -- ---------------------------------------------------------
@@ -1478,6 +1464,69 @@ function UI:CreateMonitor(options)
     end
 
     local function shortId(id) return id:match("%d+") or id end
+
+    local TIP = { ["Blox Fruit"] = "Fruit", Melee = "Melee", Sword = "Sword", Gun = "Gun" }
+
+    -- lo que tiene en la mano: nombre y categoria (Fruit / Sword / Melee / Gun)
+    local function heldTool(char)
+        local t = char and char:FindFirstChildOfClass("Tool")
+        if not t then return nil, nil end
+        return t.Name, TIP[t.ToolTip] or (t.ToolTip ~= "" and t.ToolTip or "Item")
+    end
+
+    local function fmtPos(v) return v and string.format("%.0f, %.0f, %.0f", v.X, v.Y, v.Z) or "?" end
+
+    local function compact(n)
+        n = tonumber(n)
+        if not n then return "?" end
+        if n >= 1e9 then return string.format("%.2fB", n / 1e9) end
+        if n >= 1e6 then return string.format("%.2fM", n / 1e6) end
+        if n >= 1e3 then return string.format("%.1fK", n / 1e3) end
+        return string.format("%.0f", n)
+    end
+
+    local function valueOf(parent, name)
+        local o = parent and parent:FindFirstChild(name)
+        if not o then return nil end
+        local ok, v = pcall(function() return o.Value end)
+        return ok and v or nil
+    end
+
+    -- nivel, raza, fruta y bounty salen de las carpetas del juego (Data y leaderstats)
+    local function playerInfo(p)
+        local info, ls = p:FindFirstChild("Data"), p:FindFirstChild("leaderstats")
+        return valueOf(info, "Level"), valueOf(info, "Race"), valueOf(info, "DevilFruit"),
+            valueOf(ls, "Bounty/Honor") or valueOf(ls, "Bounty")
+    end
+
+    local function isV4(char)
+        local o = char and char:FindFirstChild("RaceTransformed")
+        return (o and o:IsA("ValueBase") and o.Value == true) or (char and char:GetAttribute("RaceTransformed") == true) or false
+    end
+
+    -- ---------------------------------------------------------
+    --  avisos y registro (con coordenadas y lo que llevaba en la mano)
+    -- ---------------------------------------------------------
+    local function addLog(name, kind, detail)
+        log[#log + 1] = { t = os.date("%H:%M:%S"), name = name, kind = kind, detail = detail }
+        if #log > 100 then table.remove(log, 1) end
+    end
+
+    local function raise(p, d, kind, detail)
+        local now = os.clock()
+        d.flash[kind] = now + 4
+        if now - (d.lastNotify[kind] or -99) > 15 then
+            d.lastNotify[kind] = now
+            local hrp = p.Character and p.Character:FindFirstChild("HumanoidRootPart")
+            local tn, tc = heldTool(p.Character)
+            local full = detail .. " | pos " .. fmtPos(hrp and hrp.Position) .. (tn and (" | " .. tc .. ": " .. tn) or "")
+            if kind == "FastAttack?" or kind == "FastItem?" then d.fastFlags = d.fastFlags + 1 end
+            addLog(p.Name, kind, full)
+            d.events[#d.events + 1] = { t = os.date("%H:%M:%S"), kind = kind, detail = full }
+            if #d.events > 8 then table.remove(d.events, 1) end
+            if cfg.notify then say(p.Name, kind .. " " .. full) end
+        end
+    end
 
     local function buildFilter()
         local ignore = {}
@@ -1573,6 +1622,7 @@ function UI:CreateMonitor(options)
         if not id then return end
         local now = os.clock()
         d.anims[#d.anims + 1] = { t = now, id = id }
+        d.attacks = d.attacks + 1
         while d.anims[1] and now - d.anims[1].t > 3 do table.remove(d.anims, 1) end
         recentCasts[p] = now
 
@@ -1666,6 +1716,7 @@ function UI:CreateMonitor(options)
         -- personaje nuevo (reaparecio): empezar de cero y dar 3 s de margen
         if d.char ~= char then
             d.char, d.last, d.airT, d.grace = char, nil, 0, now + 3
+            d.peakHs, d.peakVs, d.peakRate = 0, 0, 0
             table.clear(d.score); table.clear(d.flash); table.clear(d.anims); table.clear(d.pace)
         end
 
@@ -1674,25 +1725,38 @@ function UI:CreateMonitor(options)
             for _, tr in ipairs(animator:GetPlayingAnimationTracks()) do onAnimStart(p, d, tr) end
         end
 
+        local tn, tc = heldTool(char)
+        if tn then
+            local group = d.tools[tc]
+            if not group then group = {} d.tools[tc] = group end
+            group[tn] = true
+        end
+
+        local prev = d.last
         local jump, dt = measure(d, hrp, hum, now, filter)
         local grace = d.grace or 0
 
         if now > grace then
             -- teletransporte
             if jump and jump > cfg.tpDist then
-                raise(p, d, "Teleport?", string.format("(%d studs en %.1fs)", jump, dt))
+                raise(p, d, "Teleport?", string.format("(%.0f studs en %.1fs) desde %s", jump, dt, fmtPos(prev)))
                 d.airT = 0
                 return
+            end
+
+            if not d.seated then
+                d.peakHs = math.max(d.peakHs, d.hs)
+                d.peakVs = math.max(d.peakVs, math.abs(d.vs))
             end
 
             -- lo que permite lo aprendido (dashes, vuelos legitimos de una habilidad)
             local ah, aa = allowance(p, d, now)
 
             if bump(d, "Flying?", d.airT > cfg.flyTime and d.vs > -10 and d.airT > aa * 1.15) then
-                raise(p, d, "Flying?", string.format("(%.1fs en el aire)", d.airT))
+                raise(p, d, "Flying?", string.format("(%.1fs en el aire, vel %.0f)", d.airT, d.hs))
             end
             if bump(d, "Speed?", not d.seated and d.hs > cfg.maxSpeed and d.hs > ah * 1.15) then
-                raise(p, d, "Speed?", string.format("(%d studs/s)", d.hs))
+                raise(p, d, "Speed?", string.format("(%.0f studs/s, WalkSpeed %.0f)", d.hs, hum.WalkSpeed))
             end
 
             -- atravesar paredes: el centro del personaje esta dentro de una pieza solida
@@ -1717,8 +1781,9 @@ function UI:CreateMonitor(options)
                 end
             end
             d.rate = cnt
-            if bump(d, "FastAnim?", cnt > cfg.animRate or maxRep > cfg.animRepeat) then
-                raise(p, d, "FastAnim?", string.format("(%d anim/s, misma x%d)", cnt, maxRep))
+            if cnt > d.peakRate then d.peakRate, d.peakTool = cnt, (heldTool(char)) or "-" end
+            if bump(d, "FastAttack?", cnt > cfg.animRate or maxRep > cfg.animRepeat) then
+                raise(p, d, "FastAttack?", string.format("(%d ataques/s, misma x%d)", cnt, maxRep))
             end
 
             -- ritmo contra lo aprendido por item
@@ -1858,13 +1923,64 @@ function UI:CreateMonitor(options)
     -- ---------------------------------------------------------
     --  reportes
     -- ---------------------------------------------------------
+    local ORDER = { "Fruit", "Sword", "Melee", "Gun" }
+
+    local function toolsLine(d)
+        local out = {}
+        for _, k in ipairs(ORDER) do
+            local names = {}
+            for n in pairs(d.tools[k] or {}) do names[#names + 1] = n end
+            table.sort(names)
+            if #names > 0 then out[#out + 1] = k .. ": " .. table.concat(names, ", ") end
+        end
+        for k, set in pairs(d.tools) do
+            if not table.find(ORDER, k) then
+                local names = {}
+                for n in pairs(set) do names[#names + 1] = n end
+                table.sort(names)
+                out[#out + 1] = k .. ": " .. table.concat(names, ", ")
+            end
+        end
+        return #out > 0 and table.concat(out, " | ") or "nada visto aun"
+    end
+
+    -- ficha completa de un jugador
+    local function dossier(p, d)
+        local char = p.Character
+        local hum = char and char:FindFirstChildOfClass("Humanoid")
+        local hrp = char and char:FindFirstChild("HumanoidRootPart")
+        local lvl, race, fruit, bounty = playerInfo(p)
+        local tn, tc = heldTool(char)
+        local lines = {
+            string.format("%s (@%s)  estado: %s", p.DisplayName, p.Name, d.status or "-"),
+            string.format("Nivel %s | Raza %s%s | Bounty %s", tostring(lvl or "?"), tostring(race or "?"), isV4(char) and " V4" or "", compact(bounty)),
+            "Fruta: " .. ((fruit and fruit ~= "") and tostring(fruit) or "ninguna / oculta"),
+            "En la mano: " .. (tn and (tc .. " - " .. tn) or "nada"),
+            "Visto: " .. toolsLine(d),
+            "Pos: " .. fmtPos(hrp and hrp.Position),
+            string.format("Vel: %.0f (pico %.0f) | vertical %.0f (pico %.0f) | WalkSpeed %s | Salto %s",
+                d.hs, d.peakHs, d.vs, d.peakVs, hum and string.format("%.0f", hum.WalkSpeed) or "?", hum and string.format("%.0f", hum.JumpPower) or "?"),
+            string.format("Aire: %.1fs | Vida: %s", d.airT, hum and string.format("%.0f/%.0f", hum.Health, hum.MaxHealth) or "?"),
+            string.format("Ataques: %d total | %d/s ahora | pico %d/s (%s) | alertas de fast attack: %d",
+                d.attacks, d.rate or 0, d.peakRate, d.peakTool, d.fastFlags),
+        }
+        if #d.events > 0 then
+            lines[#lines + 1] = "Ultimos avisos:"
+            for i = #d.events, math.max(1, #d.events - 3), -1 do
+                local e = d.events[i]
+                lines[#lines + 1] = "  [" .. e.t .. "] " .. e.kind .. " " .. e.detail
+            end
+        end
+        return table.concat(lines, "\n")
+    end
+
     local function report()
         print("---- Player Monitor ----")
         local n = 0
         for p, d in pairs(data) do
             n = n + 1
-            print(string.format("%-18s %-26s vel %3d | vert %4d | aire %.1fs | anim/s %d | item %s",
-                p.Name, d.status, d.hs, d.vs, d.airT, d.rate or 0, toolName(p.Character)))
+            print(dossier(p, d))
+            print("")
         end
         if n == 0 then print("Sin datos todavia: enciende el Monitor y espera unos segundos.") end
     end
@@ -1917,6 +2033,19 @@ function UI:CreateMonitor(options)
         end
         local FlagLabel, LearnLabel
         pcall(function() FlagLabel = Tab:CreateLabel("Nadie marcado") end)
+
+        section("Jugador")
+        local PlayerDD, DossierLabel
+        local function names()
+            local out = {}
+            for p in pairs(data) do if p.Parent then out[#out + 1] = p.Name end end
+            table.sort(out)
+            if #out == 0 then out[1] = "(nadie)" end
+            return out
+        end
+        pcall(function() PlayerDD = Tab:CreateDropdown({ Text = "Ver jugador", Options = names(), Callback = function() end }) end)
+        pcall(function() DossierLabel = Tab:CreateLabel("Enciende el Monitor y elige un jugador") end)
+        local lastNames = ""
 
         section("Monitor")
         Tab:CreateToggle({
@@ -1974,6 +2103,24 @@ function UI:CreateMonitor(options)
                 task.wait(1)
                 if FlagLabel and FlagLabel.Set and cfg.on then pcall(function() FlagLabel:Set(flaggedText()) end) end
                 if LearnLabel and LearnLabel.Set then pcall(function() LearnLabel:Set(learnedText()) end) end
+                if PlayerDD and cfg.on then
+                    pcall(function()
+                        local list = names()
+                        local key = table.concat(list, ",")
+                        if key ~= lastNames then
+                            lastNames = key
+                            PlayerDD:Refresh(list, true)
+                        end
+                        local sel
+                        for p, d in pairs(data) do if p.Name == PlayerDD.Value then sel = { p, d } end end
+                        if not sel then
+                            for p, d in pairs(data) do if d.status ~= "-" and d.status ~= "OK" then sel = { p, d } break end end
+                        end
+                        if DossierLabel and DossierLabel.Set then
+                            DossierLabel:Set(sel and dossier(sel[1], sel[2]) or "Elige un jugador")
+                        end
+                    end)
+                end
             end
         end)
     end
