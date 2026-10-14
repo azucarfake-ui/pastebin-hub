@@ -28,6 +28,14 @@
 	círculo y la ventana vuelve a abrirse. (Ya no hay tecla para abrir ni
 	cerrar; por código siguen existiendo Window:Show(), :Hide() y :Toggle().)
 
+	MONITOR DE JUGADORES (integrado): agrega una pestaña "Monitor" que marca a
+	los jugadores que vuelan, van demasiado rápido, se teletransportan,
+	atraviesan paredes o usan animaciones a un ritmo raro. Incluye un modo
+	"aprender" por ítem (fruta, espada, melee, arma).
+	  • al crear la ventana:  Monitor = true   (o una tabla: Monitor = { AutoStart = true })
+	  • o a mano:             Window:CreateMonitor({ AutoStart = true })
+	Es una PISTA, no una prueba: puede dar falsos positivos.
+
 	Uso:
 		local UI = loadstring(game:HttpGet("...PasteBinHub.lua"))()
 		local Window = UI:CreateWindow({
@@ -40,6 +48,7 @@
 			Height      = 300,
 			Draggable   = true,       -- true = se mueve arrastrando la barra de arriba (false = fija)
 			ShowOrb     = true,       -- false = al cerrar no aparece el círculo con la calavera
+			Monitor     = false,      -- true = agrega la pestaña Monitor (detector de jugadores)
 			AutoSaveConfig  = true,
 			AutoLoadStagger = 0.1,
 			AutoLoadOrder   = {"M", "F", "A"},
@@ -639,6 +648,16 @@ function UI:CreateWindow(config)
 		end
 	end
 
+	-- Monitor = true (o una tabla de opciones) agrega la pestaña Monitor.
+	-- Se crea "diferida", así queda DESPUÉS de las pestañas que crees tú.
+	if config.Monitor then
+		local monitorOptions = typeof(config.Monitor) == "table" and config.Monitor or nil
+		task.defer(function()
+			local ok, err = pcall(function() Window:CreateMonitor(monitorOptions) end)
+			if not ok then warn("[PasteBinHub] No se pudo crear el Monitor: " .. tostring(err)) end
+		end)
+	end
+
 	return Window
 end
 
@@ -705,6 +724,7 @@ function UI:Hide(silent)
 end
 function UI:Toggle() if self._visible then self:Hide() else self:Show() end end
 function UI:Destroy()
+	if self._monitorStop then pcall(self._monitorStop) end
 	for _, conn in ipairs(self._connections or {}) do pcall(function() conn:Disconnect() end) end
 	if self.ScreenGui then pcall(function() self.ScreenGui:Destroy() end) end
 	for i, w in ipairs(UI.Windows) do if w == self then table.remove(UI.Windows, i) break end end
@@ -1351,6 +1371,620 @@ function UI:ListConfigs()
 		if fname then table.insert(names, fname) end
 	end
 	return names
+end
+
+-- ============================================================
+-- 	MONITOR DE JUGADORES (integrado)
+-- ============================================================
+-- Window:CreateMonitor({ AutoStart = false, TabName = "Monitor" })
+-- Crea una pestaña que marca a los jugadores que vuelan, van demasiado
+-- rápido, se teletransportan, atraviesan paredes o usan animaciones a
+-- un ritmo raro. Tiene un modo "aprender" por ítem (se guarda en
+-- PlayerMonitor/learned.json). Es una PISTA, no una prueba.
+function UI:CreateMonitor(options)
+    local window = self
+    options = options or {}
+    if type(rawget(_G, "__PlayerMonitorStop")) == "function" then pcall(_G.__PlayerMonitorStop) end
+    local Players = game:GetService("Players")
+    local HttpService = game:GetService("HttpService")
+    local lp = Players.LocalPlayer
+
+    local FOLDER, FILE = "PlayerMonitor", "PlayerMonitor/learned.json"
+    local cfg = {
+        on = false, notify = true, tags = false, learn = false, far = false, noclip = true,
+        maxSpeed = 90, flyTime = 2.5, tpDist = 200, step = 0.2,
+        animRate = 7, animRepeat = 5, paceFactor = 0.6, farDist = 600,
+    }
+    local KINDS = { "Flying?", "Speed?", "Teleport?", "Noclip?", "FastAnim?", "FastItem?", "FarEffect?" }
+
+    local data = {}                 -- [player] = estado
+    local log = {}                  -- ultimos avisos
+    local learned = { items = {} }  -- items[tool][animId] = { gap, hs, air, n }
+    local recentCasts = {}          -- [player] = ultimo momento en que lanzo una accion
+    local gen, running, alive = 0, false, true
+    local conns, farConn, selfConn = {}, nil, nil
+    local selfD = { airT = 0, hs = 0, vs = 0, lastStart = {}, seen = setmetatable({}, { __mode = "k" }) }
+
+    -- ---------------------------------------------------------
+    --  avisos y registro
+    -- ---------------------------------------------------------
+    local function say(title, text)
+        if window and window.Notify then
+            pcall(function() window:Notify({ Title = title, Text = text, Duration = 4 }) end)
+        else
+            warn("[Monitor] " .. title .. ": " .. text)
+        end
+    end
+
+    local function addLog(name, kind, detail)
+        log[#log + 1] = { t = os.date("%H:%M:%S"), name = name, kind = kind, detail = detail }
+        if #log > 100 then table.remove(log, 1) end
+    end
+
+    local function getData(p)
+        local d = data[p]
+        if not d then
+            d = {
+                score = {}, flash = {}, lastNotify = {}, airT = 0, hs = 0, vs = 0, rate = 0,
+                status = "-", anims = {}, lastStart = {}, pace = {},
+                seen = setmetatable({}, { __mode = "k" }),
+            }
+            data[p] = d
+        end
+        return d
+    end
+
+    -- el contador sube mientras se cumple y baja si no: un tiron de lag no marca a nadie
+    local function bump(d, kind, cond)
+        local s = d.score[kind] or 0
+        if cond then s = math.min(s + 1, 10) else s = math.max(s - 0.5, 0) end
+        d.score[kind] = s
+        return s >= 5
+    end
+
+    local function raise(p, d, kind, detail)
+        local now = os.clock()
+        d.flash[kind] = now + 4
+        if now - (d.lastNotify[kind] or -99) > 15 then
+            d.lastNotify[kind] = now
+            addLog(p.Name, kind, detail)
+            if cfg.notify then say(p.Name, kind .. " " .. detail) end
+        end
+    end
+
+    -- ---------------------------------------------------------
+    --  utilidades
+    -- ---------------------------------------------------------
+    local function toolName(char)
+        local t = char and char:FindFirstChildOfClass("Tool")
+        return t and t.Name or "_none"
+    end
+
+    local function animId(track)
+        local ok, id = pcall(function() return track.Animation and track.Animation.AnimationId end)
+        if ok and typeof(id) == "string" and id ~= "" then return id end
+        return nil
+    end
+
+    -- solo animaciones de ACCION y que no se repiten en bucle (ataques, habilidades)
+    local function isAction(track)
+        local ok, res = pcall(function()
+            if track.Looped then return false end
+            local pri = track.Priority
+            return pri ~= Enum.AnimationPriority.Idle and pri ~= Enum.AnimationPriority.Movement
+                and pri ~= Enum.AnimationPriority.Core
+        end)
+        return ok and res
+    end
+
+    local function shortId(id) return id:match("%d+") or id end
+
+    local function buildFilter()
+        local ignore = {}
+        for _, pl in ipairs(Players:GetPlayers()) do
+            if pl.Character then ignore[#ignore + 1] = pl.Character end
+        end
+        for _, name in ipairs({ "Enemies", "Characters", "NPCs" }) do
+            local f = workspace:FindFirstChild(name)
+            if f then ignore[#ignore + 1] = f end
+        end
+        local ray = RaycastParams.new()
+        ray.FilterType = Enum.RaycastFilterType.Exclude
+        ray.FilterDescendantsInstances = ignore
+        local ov = OverlapParams.new()
+        ov.FilterType = Enum.RaycastFilterType.Exclude
+        ov.FilterDescendantsInstances = ignore
+        return { ray = ray, ov = ov }
+    end
+
+    -- calcula velocidad horizontal, vertical y tiempo en el aire; devuelve el salto de posicion
+    local function measure(d, hrp, hum, now, filter)
+        local pos = hrp.Position
+        local dt = d.lastT and (now - d.lastT) or 0
+        d.lastT = now
+        local jump
+        if d.last and dt > 0 then
+            local delta = pos - d.last
+            d.hs = Vector3.new(delta.X, 0, delta.Z).Magnitude / dt
+            d.vs = delta.Y / dt
+            jump = delta.Magnitude
+        end
+        d.last = pos
+        local seated = hum.SeatPart ~= nil
+        local ground = workspace:Raycast(pos, Vector3.new(0, -14, 0), filter.ray)
+        if ground or seated then d.airT = 0 elseif dt > 0 then d.airT = d.airT + dt end
+        d.seated = seated
+        return jump, dt
+    end
+
+    -- ---------------------------------------------------------
+    --  aprendido: cargar / guardar
+    -- ---------------------------------------------------------
+    local function countLearned()
+        local items, anims = 0, 0
+        for _, t in pairs(learned.items) do
+            items = items + 1
+            for _ in pairs(t) do anims = anims + 1 end
+        end
+        return items, anims
+    end
+
+    local function saveLearned(silent)
+        if typeof(writefile) ~= "function" then
+            if not silent then say("Monitor", "Tu ejecutor no tiene writefile: no se puede guardar") end
+            return false
+        end
+        if typeof(isfolder) == "function" and typeof(makefolder) == "function" and not isfolder(FOLDER) then
+            pcall(makefolder, FOLDER)
+        end
+        local ok, encoded = pcall(function() return HttpService:JSONEncode(learned) end)
+        if not ok then return false end
+        local okW = pcall(writefile, FILE, encoded)
+        if okW and not silent then
+            local i, a = countLearned()
+            say("Monitor", "Guardado: " .. i .. " items, " .. a .. " animaciones")
+        end
+        return okW
+    end
+
+    local function loadLearned()
+        if typeof(isfile) ~= "function" or typeof(readfile) ~= "function" or not isfile(FILE) then return end
+        local ok, decoded = pcall(function() return HttpService:JSONDecode(readfile(FILE)) end)
+        if ok and typeof(decoded) == "table" and typeof(decoded.items) == "table" then learned = decoded end
+    end
+    loadLearned()
+
+    local function learnEntry(tool, id)
+        local it = learned.items[tool]
+        if not it then it = {} learned.items[tool] = it end
+        local e = it[id]
+        if not e then e = { hs = 0, air = 0, n = 0 } it[id] = e end
+        return e
+    end
+
+    -- ---------------------------------------------------------
+    --  animaciones de OTROS jugadores
+    -- ---------------------------------------------------------
+    local function onAnimStart(p, d, track)
+        if d.seen[track] then return end
+        d.seen[track] = true
+        if not isAction(track) then return end
+        local id = animId(track)
+        if not id then return end
+        local now = os.clock()
+        d.anims[#d.anims + 1] = { t = now, id = id }
+        while d.anims[1] and now - d.anims[1].t > 3 do table.remove(d.anims, 1) end
+        recentCasts[p] = now
+
+        -- ritmo contra lo aprendido para este item
+        local tool = toolName(p.Character)
+        local e = learned.items[tool] and learned.items[tool][id]
+        local key = tool .. "|" .. id
+        local last = d.lastStart[key]
+        d.lastStart[key] = now
+        if e and e.gap and (e.n or 0) >= 3 and last then
+            local g = now - last
+            if g >= 0.05 and g < e.gap * cfg.paceFactor then
+                d.pace[#d.pace + 1] = now
+                d.paceInfo = tool .. " " .. shortId(id)
+            end
+        end
+    end
+
+    local function hookAnimator(p, d, hum)
+        local animator = hum:FindFirstChildOfClass("Animator")
+        if animator and d.animator ~= animator then
+            if d.animConn then d.animConn:Disconnect() end
+            d.animator = animator
+            d.animConn = animator.AnimationPlayed:Connect(function(track) onAnimStart(p, d, track) end)
+        end
+        return animator
+    end
+
+    -- lo que permite lo aprendido segun las animaciones que uso hace poco
+    local function allowance(p, d, now)
+        local tool = toolName(p.Character)
+        local items = learned.items[tool]
+        if not items then return 0, 0 end
+        local ah, aa = 0, 0
+        for _, a in ipairs(d.anims) do
+            if now - a.t <= 1.5 then
+                local e = items[a.id]
+                if e then
+                    ah = math.max(ah, e.hs or 0)
+                    aa = math.max(aa, e.air or 0)
+                end
+            end
+        end
+        return ah, aa
+    end
+
+    -- ---------------------------------------------------------
+    --  etiqueta sobre la cabeza
+    -- ---------------------------------------------------------
+    local function setTag(p, d, text)
+        local head = p.Character and p.Character:FindFirstChild("Head")
+        if not cfg.tags or not text or not head then
+            if d.tag then d.tag:Destroy() d.tag, d.tagLabel = nil, nil end
+            return
+        end
+        if not d.tag or not d.tag.Parent then
+            local tag = Instance.new("BillboardGui")
+            tag.Name = "MonitorESPTag"  -- "ESP" en el nombre: el limpiador de lag de tu hub no lo borra
+            tag.Size = UDim2.new(0, 170, 0, 22)
+            tag.StudsOffset = Vector3.new(0, 3.6, 0)
+            tag.AlwaysOnTop = true
+            tag.Adornee = head
+            tag.Parent = head
+            local lbl = Instance.new("TextLabel")
+            lbl.Size = UDim2.new(1, 0, 1, 0)
+            lbl.BackgroundTransparency = 1
+            lbl.Font = Enum.Font.GothamBold
+            lbl.TextSize = 13
+            lbl.TextColor3 = Color3.fromRGB(255, 80, 80)
+            lbl.TextStrokeTransparency = 0.4
+            lbl.Parent = tag
+            d.tag, d.tagLabel = tag, lbl
+        end
+        d.tagLabel.Text = text
+    end
+
+    -- ---------------------------------------------------------
+    --  revision de UN jugador
+    -- ---------------------------------------------------------
+    local function check(p, d, now, filter)
+        local char = p.Character
+        local hrp = char and char:FindFirstChild("HumanoidRootPart")
+        local hum = char and char:FindFirstChildOfClass("Humanoid")
+        if not (hrp and hum and hum.Health > 0) then
+            d.last, d.char, d.airT, d.status, d.hs, d.vs, d.rate = nil, nil, 0, "-", 0, 0, 0
+            table.clear(d.score); table.clear(d.flash); table.clear(d.anims); table.clear(d.pace)
+            setTag(p, d, nil)
+            return
+        end
+
+        -- personaje nuevo (reaparecio): empezar de cero y dar 3 s de margen
+        if d.char ~= char then
+            d.char, d.last, d.airT, d.grace = char, nil, 0, now + 3
+            table.clear(d.score); table.clear(d.flash); table.clear(d.anims); table.clear(d.pace)
+        end
+
+        local animator = hookAnimator(p, d, hum)
+        if animator then
+            for _, tr in ipairs(animator:GetPlayingAnimationTracks()) do onAnimStart(p, d, tr) end
+        end
+
+        local jump, dt = measure(d, hrp, hum, now, filter)
+        local grace = d.grace or 0
+
+        if now > grace then
+            -- teletransporte
+            if jump and jump > cfg.tpDist then
+                raise(p, d, "Teleport?", string.format("(%d studs en %.1fs)", jump, dt))
+                d.airT = 0
+                return
+            end
+
+            -- lo que permite lo aprendido (dashes, vuelos legitimos de una habilidad)
+            local ah, aa = allowance(p, d, now)
+
+            if bump(d, "Flying?", d.airT > cfg.flyTime and d.vs > -10 and d.airT > aa * 1.15) then
+                raise(p, d, "Flying?", string.format("(%.1fs en el aire)", d.airT))
+            end
+            if bump(d, "Speed?", not d.seated and d.hs > cfg.maxSpeed and d.hs > ah * 1.15) then
+                raise(p, d, "Speed?", string.format("(%d studs/s)", d.hs))
+            end
+
+            -- atravesar paredes: el centro del personaje esta dentro de una pieza solida
+            if cfg.noclip and not d.seated then
+                local inside = false
+                local ok, parts = pcall(workspace.GetPartBoundsInRadius, workspace, hrp.Position, 0.7, filter.ov)
+                if ok then
+                    for _, part in ipairs(parts) do
+                        if part.CanCollide then inside = true break end
+                    end
+                end
+                if bump(d, "Noclip?", inside) then raise(p, d, "Noclip?", "(dentro de una pieza solida)") end
+            end
+
+            -- ritmo de animaciones de accion
+            local cnt, perId, maxRep = 0, {}, 0
+            for _, a in ipairs(d.anims) do
+                if now - a.t <= 1 then
+                    cnt = cnt + 1
+                    perId[a.id] = (perId[a.id] or 0) + 1
+                    if perId[a.id] > maxRep then maxRep = perId[a.id] end
+                end
+            end
+            d.rate = cnt
+            if bump(d, "FastAnim?", cnt > cfg.animRate or maxRep > cfg.animRepeat) then
+                raise(p, d, "FastAnim?", string.format("(%d anim/s, misma x%d)", cnt, maxRep))
+            end
+
+            -- ritmo contra lo aprendido por item
+            while d.pace[1] and now - d.pace[1] > 2 do table.remove(d.pace, 1) end
+            if #d.pace >= 3 then
+                raise(p, d, "FastItem?", "(" .. tostring(d.paceInfo) .. " mas rapido de lo aprendido)")
+                table.clear(d.pace)
+            end
+        end
+
+        local names = {}
+        for _, k in ipairs(KINDS) do
+            if (d.flash[k] or 0) > now then names[#names + 1] = k end
+        end
+        d.status = #names > 0 and table.concat(names, " ") or "OK"
+        setTag(p, d, #names > 0 and table.concat(names, " ") or nil)
+    end
+
+    -- ---------------------------------------------------------
+    --  MODO APRENDER (tus propias acciones)
+    -- ---------------------------------------------------------
+    local function onSelfAnim(track)
+        if selfD.seen[track] then return end
+        selfD.seen[track] = true
+        if not cfg.learn or not isAction(track) then return end
+        local id = animId(track)
+        if not id then return end
+        local tool = toolName(lp.Character)
+        local key = tool .. "|" .. id
+        local now = os.clock()
+        local last = selfD.lastStart[key]
+        selfD.lastStart[key] = now
+        local e = learnEntry(tool, id)
+        e.n = e.n + 1
+        if last then
+            local g = now - last
+            if g >= 0.15 then e.gap = e.gap and math.min(e.gap, g) or g end
+        end
+    end
+
+    local function learnTick(now, filter)
+        local char = lp.Character
+        local hrp = char and char:FindFirstChild("HumanoidRootPart")
+        local hum = char and char:FindFirstChildOfClass("Humanoid")
+        if not (hrp and hum and hum.Health > 0) then selfD.last = nil return end
+        if selfD.char ~= char then selfD.char, selfD.last, selfD.airT = char, nil, 0 end
+        local animator = hum:FindFirstChildOfClass("Animator")
+        if animator and selfD.animator ~= animator then
+            if selfConn then selfConn:Disconnect() end
+            selfD.animator = animator
+            selfConn = animator.AnimationPlayed:Connect(onSelfAnim)
+        end
+        measure(selfD, hrp, hum, now, filter)
+        if not animator then return end
+        local tool = toolName(char)
+        for _, tr in ipairs(animator:GetPlayingAnimationTracks()) do
+            onSelfAnim(tr)
+            if isAction(tr) then
+                local id = animId(tr)
+                if id then
+                    local e = learnEntry(tool, id)
+                    e.hs = math.max(e.hs or 0, selfD.hs)
+                    e.air = math.max(e.air or 0, selfD.airT)
+                end
+            end
+        end
+    end
+
+    -- ---------------------------------------------------------
+    --  bucle unico
+    -- ---------------------------------------------------------
+    local function loop(myGen)
+        while (cfg.on or cfg.learn) and gen == myGen and alive do
+            local now = os.clock()
+            local filter = buildFilter()
+            if cfg.learn then pcall(learnTick, now, filter) end
+            if cfg.on then
+                for _, p in ipairs(Players:GetPlayers()) do
+                    if p ~= lp then pcall(check, p, getData(p), now, filter) end
+                end
+            end
+            task.wait(cfg.step)
+        end
+        if gen == myGen then running = false end
+    end
+
+    local function ensureLoop()
+        if running then return end
+        running = true
+        gen = gen + 1
+        task.spawn(loop, gen)
+    end
+
+    local function clearTags()
+        for p, d in pairs(data) do setTag(p, d, nil) end
+    end
+
+    table.insert(conns, Players.PlayerRemoving:Connect(function(p)
+        local d = data[p]
+        if d then
+            if d.animConn then d.animConn:Disconnect() end
+            if d.tag then d.tag:Destroy() end
+        end
+        data[p], recentCasts[p] = nil, nil
+    end))
+
+    -- ---------------------------------------------------------
+    --  efectos lejanos (experimental)
+    --  Tras lanzar una accion, cuenta piezas nuevas que aparecen muy lejos del que la lanzo.
+    -- ---------------------------------------------------------
+    local function setFar(on)
+        if farConn then farConn:Disconnect() farConn = nil end
+        if not on then return end
+        farConn = workspace.DescendantAdded:Connect(function(o)
+            if not (cfg.on and cfg.far) or next(recentCasts) == nil then return end
+            if not o:IsA("BasePart") then return end
+            local now = os.clock()
+            for p, t in pairs(recentCasts) do
+                if now - t > 1.2 then
+                    recentCasts[p] = nil
+                else
+                    local d = data[p]
+                    local hrp = p.Character and p.Character:FindFirstChild("HumanoidRootPart")
+                    if d and hrp and not o:IsDescendantOf(p.Character)
+                        and (o.Position - hrp.Position).Magnitude > cfg.farDist then
+                        d.far = (d.far or 0) + 1
+                        if d.far >= 3 then
+                            d.far = 0
+                            raise(p, d, "FarEffect?", string.format("(piezas a mas de %d studs)", cfg.farDist))
+                        end
+                    end
+                end
+            end
+        end)
+    end
+
+    -- ---------------------------------------------------------
+    --  reportes
+    -- ---------------------------------------------------------
+    local function report()
+        print("---- Player Monitor ----")
+        local n = 0
+        for p, d in pairs(data) do
+            n = n + 1
+            print(string.format("%-18s %-26s vel %3d | vert %4d | aire %.1fs | anim/s %d | item %s",
+                p.Name, d.status, d.hs, d.vs, d.airT, d.rate or 0, toolName(p.Character)))
+        end
+        if n == 0 then print("Sin datos todavia: enciende el Monitor y espera unos segundos.") end
+    end
+
+    local function printLog()
+        print("---- Registro de avisos ----")
+        if #log == 0 then print("(vacio)") return end
+        for _, e in ipairs(log) do print(string.format("[%s] %-16s %-11s %s", e.t, e.name, e.kind, e.detail)) end
+    end
+
+    local function flaggedText()
+        local out = {}
+        for p, d in pairs(data) do
+            if d.status ~= "-" and d.status ~= "OK" then out[#out + 1] = p.Name .. ": " .. d.status end
+        end
+        table.sort(out)
+        if #out == 0 then return "Nadie marcado" end
+        if #out > 6 then out = { table.unpack(out, 1, 6) } end
+        return table.concat(out, "\n")
+    end
+
+    local function learnedText()
+        local i, a = countLearned()
+        return "Aprendido: " .. i .. " items, " .. a .. " animaciones"
+    end
+
+    _G.PlayerMonitor = { Data = data, Learned = learned, Config = cfg, Log = log, Report = report }
+    _G.__PlayerMonitorStop = function()
+        alive = false
+        cfg.on, cfg.learn, cfg.far = false, false, false
+        gen = gen + 1
+        if farConn then farConn:Disconnect() farConn = nil end
+        if selfConn then selfConn:Disconnect() selfConn = nil end
+        for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
+        for p, d in pairs(data) do
+            if d.animConn then d.animConn:Disconnect() end
+            setTag(p, d, nil)
+        end
+    end
+
+    -- ---------------------------------------------------------
+    --  interfaz (solo si hay ventana)
+    -- ---------------------------------------------------------
+    do
+        local Tab = window:CreateTab({ Name = options.TabName or "Monitor" })
+        local function section(text)
+            pcall(function()
+                if Tab.CreateSection then Tab:CreateSection(text) else Tab:CreateSectionLabel(text) end
+            end)
+        end
+        local FlagLabel, LearnLabel
+        pcall(function() FlagLabel = Tab:CreateLabel("Nadie marcado") end)
+
+        section("Monitor")
+        Tab:CreateToggle({
+            Text = "Monitor", Default = false, Flag = "MonitorOn",
+            Callback = function(v)
+                cfg.on = v
+                if v then ensureLoop() else clearTags() end
+            end,
+        })
+        Tab:CreateToggle({ Text = "Avisos en pantalla", Default = true, Flag = "MonitorNotify", Callback = function(v) cfg.notify = v end })
+        Tab:CreateToggle({
+            Text = "Etiquetas sobre la cabeza", Default = false, Flag = "MonitorTags",
+            Callback = function(v) cfg.tags = v if not v then clearTags() end end,
+        })
+        Tab:CreateToggle({ Text = "Detectar atravesar paredes", Default = true, Flag = "MonitorNoclip", Callback = function(v) cfg.noclip = v end })
+        Tab:CreateToggle({
+            Text = "Efectos lejanos (experimental)", Default = false, Flag = "MonitorFar",
+            Callback = function(v) cfg.far = v setFar(v) end,
+        })
+
+        section("Limites")
+        Tab:CreateSlider({ Text = "Velocidad maxima", Range = { 30, 300 }, Default = 90, Flag = "MonitorSpeed", Callback = function(v) cfg.maxSpeed = v end })
+        Tab:CreateSlider({ Text = "Tiempo en el aire (s)", Range = { 1, 8 }, Increment = 0.5, Default = 2.5, Flag = "MonitorFly", Callback = function(v) cfg.flyTime = v end })
+        Tab:CreateSlider({ Text = "Distancia de teletransporte", Range = { 50, 1000 }, Increment = 10, Default = 200, Flag = "MonitorTp", Callback = function(v) cfg.tpDist = v end })
+        Tab:CreateSlider({ Text = "Animaciones por segundo", Range = { 3, 20 }, Default = 7, Flag = "MonitorAnimRate", Callback = function(v) cfg.animRate = v end })
+        Tab:CreateSlider({ Text = "Misma animacion repetida", Range = { 2, 12 }, Default = 5, Flag = "MonitorAnimRepeat", Callback = function(v) cfg.animRepeat = v end })
+        Tab:CreateSlider({ Text = "Efectos lejanos (studs)", Range = { 200, 2000 }, Increment = 50, Default = 600, Flag = "MonitorFarDist", Callback = function(v) cfg.farDist = v end })
+
+        section("Aprender")
+        pcall(function() LearnLabel = Tab:CreateLabel(learnedText()) end)
+        Tab:CreateToggle({
+            Text = "Modo aprender (mis acciones)", Default = false, Flag = "MonitorLearn",
+            Callback = function(v)
+                cfg.learn = v
+                if v then ensureLoop() else saveLearned(true) end
+            end,
+        })
+        Tab:CreateButton({ Text = "Guardar lo aprendido", Callback = function() saveLearned(false) end })
+        Tab:CreateButton({
+            Text = "Borrar lo aprendido",
+            Callback = function()
+                learned.items = {}
+                saveLearned(true)
+                say("Monitor", "Se borro lo aprendido")
+            end,
+        })
+
+        section("Registro")
+        Tab:CreateButton({ Text = "Imprimir reporte (F9)", Callback = report })
+        Tab:CreateButton({ Text = "Imprimir registro (F9)", Callback = printLog })
+
+        -- refresca los textos una vez por segundo
+        task.spawn(function()
+            while alive do
+                task.wait(1)
+                if FlagLabel and FlagLabel.Set and cfg.on then pcall(function() FlagLabel:Set(flaggedText()) end) end
+                if LearnLabel and LearnLabel.Set then pcall(function() LearnLabel:Set(learnedText()) end) end
+            end
+        end)
+    end
+
+    -- al destruir la ventana, tambien se detiene el monitor
+    window._monitorStop = _G.__PlayerMonitorStop
+    if options.AutoStart then
+        cfg.on = true
+        ensureLoop()
+    end
+    return window
 end
 
 return UI
