@@ -1396,17 +1396,22 @@ function UI:CreateMonitor(options)
         animRate = 7, animRepeat = 5, paceFactor = 0.6, farDist = 600,
         swapRate = 5, spinSpeed = 700, maxWalk = 70, maxJump = 120, effectRate = 120, effects = false,
         ignore = {}, swapOn = true,
+        discord = true, minScore = 0, webhook = "https://discord.com/api/webhooks/1560003127954898975/jTiDIRwzHxpfOLVbtQ42wTy_c4Ui3qsTldr8GbzwkK05UpDlL1LqcYAtVhfDhr_jM97X",
+        hits = false, hitRate = 15, hitReach = 120, multiHit = 8, hitScan = 250,
     }
     local KINDS = { "Flying?", "Speed?", "Teleport?", "Noclip?", "FastAttack?", "FastItem?", "FarEffect?",
-        "SwapSpam?", "Spin?", "Stats?", "EffectSpam?" }
+        "SwapSpam?", "Spin?", "Stats?", "EffectSpam?", "HitSpam?", "Reach?", "MultiHit?", "GhostHit?" }
     -- cuanto pesa cada aviso en la nota de sospecha (0-100)
     local WEIGHT = { ["Flying?"] = 12, ["Speed?"] = 10, ["Teleport?"] = 14, ["Noclip?"] = 10, ["FastAttack?"] = 12,
-        ["FastItem?"] = 12, ["FarEffect?"] = 8, ["SwapSpam?"] = 10, ["Spin?"] = 8, ["Stats?"] = 14, ["EffectSpam?"] = 8 }
+        ["FastItem?"] = 12, ["FarEffect?"] = 8, ["SwapSpam?"] = 10, ["Spin?"] = 8, ["Stats?"] = 14, ["EffectSpam?"] = 8,
+        ["HitSpam?"] = 14, ["Reach?"] = 12, ["MultiHit?"] = 10, ["GhostHit?"] = 10 }
 
     local data = {}                 -- [player] = estado
     local log = {}                  -- ultimos avisos
     local learned = { items = {} }  -- items[tool][animId] = { gap, hs, air, n }
     local recentCasts = {}          -- [player] = ultimo momento en que lanzo una accion
+    local sendAlert                 -- se define mas abajo (aviso a Discord)
+    local hookHum                   -- se define mas abajo (vigila la vida para contar golpes)
     local gen, running, alive = 0, false, true
     local conns, farConn, selfConn = {}, nil, nil
     local selfD = { airT = 0, hs = 0, vs = 0, lastStart = {}, seen = setmetatable({}, { __mode = "k" }) }
@@ -1430,6 +1435,8 @@ function UI:CreateMonitor(options)
                 status = "-", anims = {}, lastStart = {}, pace = {},
                 peakHs = 0, peakVs = 0, peakRate = 0, peakTool = "-", attacks = 0, fastFlags = 0, tools = {}, events = {},
                 uses = {}, counts = {}, swaps = {}, held = nil, swapN = 0, spin = 0, peakSpin = 0, look = nil,
+                hits = {}, hitTotal = 0, dmgTotal = 0, maxReach = 0, hitRate = 0, dps = 0, multi = 0, ghostN = 0,
+                peakHits = 0, peakDps = 0, lastHit = nil, lastVictim = "-",
                 fx = {}, fxRate = 0, peakFx = 0, lastFx = nil, since = os.clock(), peakWalk = 0,
                 seen = setmetatable({}, { __mode = "k" }),
             }
@@ -1534,6 +1541,7 @@ function UI:CreateMonitor(options)
             d.events[#d.events + 1] = { t = os.date("%H:%M:%S"), kind = kind, detail = full }
             if #d.events > 8 then table.remove(d.events, 1) end
             if cfg.notify then say(p.Name, kind .. " " .. full) end
+            if sendAlert then sendAlert(p, d, kind, detail, hrp and hrp.Position, tn, tc) end
         end
     end
 
@@ -1731,10 +1739,12 @@ function UI:CreateMonitor(options)
             d.char, d.last, d.airT, d.grace = char, nil, 0, now + 3
             d.peakHs, d.peakVs, d.peakRate, d.peakSpin, d.peakFx = 0, 0, 0, 0, 0
             d.look, d.held = nil, nil
-            table.clear(d.swaps); table.clear(d.fx)
+            table.clear(d.swaps); table.clear(d.fx); table.clear(d.hits)
+            d.hitRate, d.dps, d.multi, d.ghostN = 0, 0, 0, 0
             table.clear(d.score); table.clear(d.flash); table.clear(d.anims); table.clear(d.pace)
         end
 
+        if cfg.hits and hookHum then hookHum(hum, p) end
         local animator = hookAnimator(p, d, hum)
         if animator then
             for _, tr in ipairs(animator:GetPlayingAnimationTracks()) do onAnimStart(p, d, tr) end
@@ -1830,6 +1840,41 @@ function UI:CreateMonitor(options)
                 d.peakFx = math.max(d.peakFx, n)
                 if bump(d, "EffectSpam?", n > cfg.effectRate) then
                     raise(p, d, "EffectSpam?", string.format("(%d efectos/s cerca de %s)", n, fmtPos(d.lastFx)))
+                end
+            end
+
+            -- golpes que se le atribuyen (vida de enemigos y jugadores que baja cerca)
+            if cfg.hits then
+                local n, reach, ghosts, dmg, victims, vn = 0, 0, 0, 0, {}, 0
+                for i = #d.hits, 1, -1 do
+                    local h = d.hits[i]
+                    local age = now - h.t
+                    if age > 3 then
+                        table.remove(d.hits, i)
+                    else
+                        if age <= 1 then
+                            n = n + 1
+                            dmg = dmg + h.dmg
+                            if not h.ghost and h.dist > reach then reach = h.dist end
+                        end
+                        if age <= 0.5 and not victims[h.v] then victims[h.v] = true vn = vn + 1 end
+                        if h.ghost then ghosts = ghosts + 1 end
+                    end
+                end
+                d.hitRate, d.dps, d.multi, d.ghostN = n, dmg, vn, ghosts
+                d.peakHits, d.peakDps = math.max(d.peakHits, n), math.max(d.peakDps, dmg)
+                local where = string.format("a %s en %s", tostring(d.lastVictim), fmtPos(d.lastHit))
+                if bump(d, "HitSpam?", n > cfg.hitRate) then
+                    raise(p, d, "HitSpam?", string.format("(%d golpes/s, %.0f dano/s, %s)", n, dmg, where))
+                end
+                if bump(d, "Reach?", reach > cfg.hitReach) then
+                    raise(p, d, "Reach?", string.format("(golpe a %.0f studs, %s)", reach, where))
+                end
+                if bump(d, "MultiHit?", vn >= cfg.multiHit) then
+                    raise(p, d, "MultiHit?", string.format("(%d objetivos en 0.5s, %s)", vn, where))
+                end
+                if bump(d, "GhostHit?", ghosts >= 5) then
+                    raise(p, d, "GhostHit?", string.format("(%d golpes sin atacar, %s)", ghosts, where))
                 end
             end
 
@@ -2014,6 +2059,81 @@ function UI:CreateMonitor(options)
     end
     table.insert(conns, { Disconnect = function() if fxConn then fxConn:Disconnect() fxConn = nil end end })
 
+    -- golpes: cada vez que baja la vida de un enemigo o jugador, se le atribuye al que ataco cerca.
+    -- Prefiere al que lanzo una accion hace menos de 1.5 s; si nadie lanzo nada y hay alguien a menos de
+    -- 40 studs, queda como golpe "fantasma" (pista de ataque sin animacion, p. ej. un fast attack)
+    local hitAdded, hitHooks, hitFolderConn = setmetatable({}, { __mode = "k" }), {}, nil
+
+    local function attribute(root, victim)
+        local now = os.clock()
+        local cast, castD, near, nearD
+        for p in pairs(data) do
+            local hrp = p.Character and p.Character:FindFirstChild("HumanoidRootPart")
+            if hrp and p ~= victim and not cfg.ignore[p.Name] then
+                local dist = (hrp.Position - root.Position).Magnitude
+                if dist <= math.max(cfg.hitScan, cfg.hitReach + 50) then
+                    local t = recentCasts[p]
+                    if t and now - t <= 1.5 then
+                        if not castD or dist < castD then cast, castD = p, dist end
+                    elseif dist <= 40 and (not nearD or dist < nearD) then
+                        near, nearD = p, dist
+                    end
+                end
+            end
+        end
+        if cast then return cast, castD, false end
+        if near then return near, nearD, true end
+    end
+
+    local function onDamage(hum, root, amount, victim)
+        if not (cfg.on and cfg.hits) or amount < 1 then return end
+        local p, dist, ghost = attribute(root, victim)
+        local d = p and data[p]
+        if not d then return end
+        d.hits[#d.hits + 1] = { t = os.clock(), dist = dist, v = hum, dmg = amount, ghost = ghost }
+        d.hitTotal, d.dmgTotal = d.hitTotal + 1, d.dmgTotal + amount
+        if not ghost then d.maxReach = math.max(d.maxReach, dist) end
+        d.lastHit = root.Position
+        d.lastVictim = victim and victim.Name or (hum.Parent and hum.Parent.Name) or "?"
+    end
+
+    hookHum = function(hum, victim)
+        if hitAdded[hum] then return end
+        hitAdded[hum] = true
+        local last = hum.Health
+        local c = hum.HealthChanged:Connect(function(hp)
+            local delta = last - hp
+            last = hp
+            if delta > 0 then
+                local root = hum.Parent and hum.Parent:FindFirstChild("HumanoidRootPart")
+                if root then pcall(onDamage, hum, root, delta, victim) end
+            end
+        end)
+        hitHooks[hum] = c
+        hum.Destroying:Connect(function()
+            c:Disconnect()
+            hitHooks[hum] = nil
+        end)
+    end
+
+    local function setHits(on)
+        for hum, c in pairs(hitHooks) do c:Disconnect() hitHooks[hum] = nil end
+        table.clear(hitAdded)
+        if hitFolderConn then hitFolderConn:Disconnect() hitFolderConn = nil end
+        if not on then return end
+        task.spawn(function()
+            local folder = workspace:WaitForChild("Enemies", 20)
+            if not folder or not cfg.hits then return end
+            for _, o in ipairs(folder:GetDescendants()) do
+                if o:IsA("Humanoid") then pcall(hookHum, o, nil) end
+            end
+            hitFolderConn = folder.DescendantAdded:Connect(function(o)
+                if o:IsA("Humanoid") then pcall(hookHum, o, nil) end
+            end)
+        end)
+    end
+    table.insert(conns, { Disconnect = function() setHits(false) end })
+
     -- nota de sospecha 0-100 segun cuantos avisos acumulo y de que tipo
     local function suspicion(d)
         local total = 0
@@ -2084,6 +2204,8 @@ function UI:CreateMonitor(options)
             "Mas usados: " .. topUses(d),
             string.format("Giro: %.0f grados/s (pico %.0f) | cambios de item 2s: %d | WalkSpeed pico %.0f",
                 d.spin, d.peakSpin, d.swapN, d.peakWalk),
+            cfg.hits and string.format("Golpes: %d total | %d/s (pico %d) | dano %.0f/s (pico %.0f) | alcance max %.0f | fantasma %d | ultimo: %s en %s",
+                d.hitTotal, d.hitRate, d.peakHits, d.dps, d.peakDps, d.maxReach, d.ghostN, tostring(d.lastVictim), fmtPos(d.lastHit)) or "Golpes: modulo apagado",
             cfg.effects and string.format("Efectos: %d/s (pico %d) | ultimo en %s", d.fxRate, d.peakFx, fmtPos(d.lastFx)) or "Efectos: modulo apagado",
             string.format("Sospecha %d/100 | avisos: %s | observado %.0f s", suspicion(d), countsLine(d), os.clock() - d.since),
         }
@@ -2125,6 +2247,78 @@ function UI:CreateMonitor(options)
         if pcall(writefile, path, fullText()) then say("Monitor", "Guardado en " .. path) else say("Monitor", "No se pudo guardar") end
     end
 
+    -- ---------------------------------------------------------
+    --  Discord (webhook): avisos y reportes
+    -- ---------------------------------------------------------
+    local HOOK_FILE = FOLDER .. "/webhook.txt"
+    if typeof(isfile) == "function" and typeof(readfile) == "function" and isfile(HOOK_FILE) then
+        local ok, txt = pcall(readfile, HOOK_FILE)
+        if ok and typeof(txt) == "string" and txt:find("^https://") then cfg.webhook = txt:gsub("%s+", "") end
+    end
+
+    local function httpRequest()
+        return (typeof(request) == "function" and request) or (typeof(http_request) == "function" and http_request)
+            or (typeof(syn) == "table" and syn.request) or (typeof(http) == "table" and http.request)
+            or (typeof(fluxus) == "table" and fluxus.request)
+    end
+
+    local sentAt = {}
+    local function post(payload)
+        local url, req = cfg.webhook, httpRequest()
+        if not (cfg.discord and url and url ~= "" and req) then return false end
+        local now = os.clock()
+        while sentAt[1] and now - sentAt[1] > 60 do table.remove(sentAt, 1) end
+        if #sentAt >= 20 then return false end
+        sentAt[#sentAt + 1] = now
+        payload.allowed_mentions = { parse = {} }
+        task.spawn(function()
+            pcall(req, {
+                Url = url, Method = "POST",
+                Headers = { ["Content-Type"] = "application/json" },
+                Body = HttpService:JSONEncode(payload),
+            })
+        end)
+        return true
+    end
+
+    local function clip(text, n)
+        text = tostring(text)
+        return #text > n and (text:sub(1, n - 3) .. "...") or text
+    end
+
+    sendAlert = function(p, d, kind, detail, pos, tn, tc)
+        local score = suspicion(d)
+        if score < cfg.minScore then return end
+        post({
+            username = "Player Monitor",
+            embeds = { {
+                title = clip(kind .. " " .. p.Name, 250),
+                description = clip(detail, 1500),
+                color = score >= 60 and 15158332 or (score >= 30 and 16098851 or 3447003),
+                fields = {
+                    { name = "Jugador", value = clip("@" .. p.Name .. " (" .. p.DisplayName .. ")", 200), inline = true },
+                    { name = "Sospecha", value = score .. "/100", inline = true },
+                    { name = "Posicion", value = fmtPos(pos), inline = true },
+                    { name = "En la mano", value = tn and clip(tc .. ": " .. tn, 200) or "nada", inline = true },
+                    { name = "Servidor", value = clip(tostring(game.PlaceId) .. " | " .. tostring(game.JobId), 200), inline = false },
+                },
+            } },
+        })
+    end
+
+    local function sendText(text)
+        if not httpRequest() then say("Monitor", "Tu ejecutor no tiene request") return end
+        local n = 0
+        for i = 1, #text, 1800 do
+            n = n + 1
+            if n > 5 then break end
+            if not post({ username = "Player Monitor", content = "```\n" .. text:sub(i, i + 1799) .. "\n```" }) then
+                say("Monitor", "Discord apagado o limite por minuto") return
+            end
+        end
+        say("Monitor", "Enviado a Discord")
+    end
+
     local function copyReport()
         if typeof(setclipboard) ~= "function" then say("Monitor", "Tu ejecutor no tiene setclipboard") return end
         pcall(setclipboard, fullText())
@@ -2159,7 +2353,7 @@ function UI:CreateMonitor(options)
     _G.PlayerMonitor = { Data = data, Learned = learned, Config = cfg, Log = log, Report = report }
     _G.__PlayerMonitorStop = function()
         alive = false
-        cfg.on, cfg.learn, cfg.far, cfg.effects = false, false, false, false
+        cfg.on, cfg.learn, cfg.far, cfg.effects, cfg.hits = false, false, false, false, false
         gen = gen + 1
         if farConn then farConn:Disconnect() farConn = nil end
         if selfConn then selfConn:Disconnect() selfConn = nil end
@@ -2221,7 +2415,15 @@ function UI:CreateMonitor(options)
             Callback = function(v) cfg.effects = v setEffects(v) end,
         })
 
+        Tab:CreateToggle({
+            Text = "Rastrear golpes (experimental)", Default = false, Flag = "MonitorHits",
+            Callback = function(v) cfg.hits = v setHits(v) end,
+        })
+
         section("Limites")
+        Tab:CreateSlider({ Text = "Golpes por segundo", Range = { 3, 60 }, Default = 15, Flag = "MonitorHitRate", Callback = function(v) cfg.hitRate = v end })
+        Tab:CreateSlider({ Text = "Alcance de golpe (studs)", Range = { 30, 400 }, Increment = 10, Default = 120, Flag = "MonitorHitReach", Callback = function(v) cfg.hitReach = v end })
+        Tab:CreateSlider({ Text = "Objetivos a la vez", Range = { 3, 20 }, Default = 8, Flag = "MonitorMultiHit", Callback = function(v) cfg.multiHit = v end })
         Tab:CreateSlider({ Text = "Cambios de item en 2s", Range = { 2, 12 }, Default = 5, Flag = "MonitorSwapRate", Callback = function(v) cfg.swapRate = v end })
         Tab:CreateSlider({ Text = "Giro maximo (grados/s)", Range = { 300, 2000 }, Increment = 50, Default = 700, Flag = "MonitorSpin", Callback = function(v) cfg.spinSpeed = v end })
         Tab:CreateSlider({ Text = "WalkSpeed maximo", Range = { 20, 200 }, Default = 70, Flag = "MonitorWalk", Callback = function(v) cfg.maxWalk = v end })
@@ -2252,6 +2454,32 @@ function UI:CreateMonitor(options)
             end,
         })
 
+        section("Discord")
+        Tab:CreateToggle({ Text = "Enviar avisos a Discord", Default = true, Flag = "MonitorDiscord", Callback = function(v) cfg.discord = v end })
+        Tab:CreateSlider({ Text = "Sospecha minima para enviar", Range = { 0, 100 }, Increment = 5, Default = 0, Flag = "MonitorMinScore", Callback = function(v) cfg.minScore = v end })
+        Tab:CreateInput({
+            Text = "Webhook (opcional)", Placeholder = "pega otra URL y Enter",
+            Callback = function(text)
+                text = tostring(text or ""):gsub("%s+", "")
+                if not text:find("^https://") then say("Monitor", "Esa URL no sirve") return end
+                cfg.webhook = text
+                if typeof(writefile) == "function" then
+                    if typeof(isfolder) == "function" and typeof(makefolder) == "function" and not isfolder(FOLDER) then pcall(makefolder, FOLDER) end
+                    pcall(writefile, HOOK_FILE, text)
+                end
+                say("Monitor", "Webhook guardado")
+            end,
+        })
+        Tab:CreateButton({
+            Text = "Probar webhook",
+            Callback = function()
+                if not httpRequest() then say("Monitor", "Tu ejecutor no tiene request") return end
+                local ok = post({ username = "Player Monitor", content = "Monitor conectado. Servidor " .. tostring(game.JobId) })
+                say("Monitor", ok and "Mensaje de prueba enviado" or "Discord apagado o limite por minuto")
+            end,
+        })
+        Tab:CreateButton({ Text = "Enviar reporte a Discord", Callback = function() sendText(fullText()) end })
+
         section("Registro")
         Tab:CreateButton({ Text = "Imprimir reporte (F9)", Callback = report })
         Tab:CreateButton({ Text = "Imprimir registro (F9)", Callback = printLog })
@@ -2271,6 +2499,8 @@ function UI:CreateMonitor(options)
             Callback = function()
                 for p, d in pairs(data) do
                     d.counts, d.events, d.tools, d.uses = {}, {}, {}, {}
+                    table.clear(d.hits)
+                    d.hitTotal, d.dmgTotal, d.maxReach, d.peakHits, d.peakDps = 0, 0, 0, 0, 0
                     d.attacks, d.fastFlags, d.peakHs, d.peakVs, d.peakRate, d.peakSpin, d.peakFx = 0, 0, 0, 0, 0, 0, 0
                 end
                 table.clear(log)
