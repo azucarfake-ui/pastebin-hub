@@ -19,9 +19,14 @@
 	  • la fila de tabs se mueve ARRASTRANDO con el mouse (o el dedo);
 	  • el contenido de la pestaña con la rueda del mouse (o el dedo).
 
+	La ventana se MUEVE arrastrando la barra de arriba (el título).
+	No se puede sacar de la pantalla: siempre queda a la vista un pedazo
+	de la barra para volver a agarrarla.
+
 	Botón X: cierra la ventana (se encoge hacia su esquina) y aparece un
 	círculo con una calavera pixelada que va chorreando píxeles. Tocás el
-	círculo (o la tecla ToggleKey) y la ventana vuelve a abrirse.
+	círculo y la ventana vuelve a abrirse. (Ya no hay tecla para abrir ni
+	cerrar; por código siguen existiendo Window:Show(), :Hide() y :Toggle().)
 
 	Uso:
 		local UI = loadstring(game:HttpGet("...PasteBinHub.lua"))()
@@ -29,12 +34,11 @@
 			Title       = "PasteBin Hub",
 			Badge       = "v1.0",
 			ServerName  = "mi hub",
-			ToggleKey   = Enum.KeyCode.K,
 			Theme       = "Verde",    -- "Verde" | "Lima" | "Ambar" | "Cian" | "Rojo"
 			CornerStyle = "Round",    -- "Round" (bordes suaves) | "Sharp" (rectos)
 			Width       = 420,
 			Height      = 300,
-			Draggable   = false,      -- true = se puede mover arrastrando la barra de arriba
+			Draggable   = true,       -- true = se mueve arrastrando la barra de arriba (false = fija)
 			ShowOrb     = true,       -- false = al cerrar no aparece el círculo con la calavera
 			AutoSaveConfig  = true,
 			AutoLoadStagger = 0.1,
@@ -483,18 +487,25 @@ function UI:CreateWindow(config)
 		end
 	end))
 
-	-- Mover la ventana (solo si config.Draggable = true): arrastrando la barra de arriba.
-	if config.Draggable then
+	-- Mover la ventana: arrastrando la barra de arriba (el título).
+	-- Viene ACTIVADO por defecto; config.Draggable = false la deja fija.
+	-- Se limita a la pantalla: siempre queda a la vista un pedazo de la
+	-- barra de arriba para poder volver a agarrarla.
+	if config.Draggable ~= false then
 		local moving, moveStart, panelStart = false, nil, nil
 		track(TopBar.InputBegan:Connect(function(input)
 			if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-				moving, moveStart, panelStart = true, input.Position, Panel.Position
+				moving, moveStart, panelStart = true, input.Position, Panel.AbsolutePosition
 			end
 		end))
 		track(UserInputService.InputChanged:Connect(function(input)
 			if moving and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
 				local d = input.Position - moveStart
-				Panel.Position = UDim2.new(panelStart.X.Scale, panelStart.X.Offset + d.X, panelStart.Y.Scale, panelStart.Y.Offset + d.Y)
+				local screen = ScreenGui.AbsoluteSize
+				local size = Panel.AbsoluteSize
+				local x = math.clamp(panelStart.X + d.X, 60 - size.X, screen.X - 60)
+				local y = math.clamp(panelStart.Y + d.Y, 0, math.max(screen.Y - HEADER_H, 0))
+				Panel.Position = UDim2.fromOffset(x, y)
 			end
 		end))
 		track(UserInputService.InputEnded:Connect(function(input)
@@ -603,21 +614,6 @@ function UI:CreateWindow(config)
 		OrbBtn.MouseLeave:Connect(function() if not Window._busy then tween(OrbScale, { Scale = 1 }, 0.1) end end)
 		table.insert(Window._connections, OrbBtn.MouseButton1Click:Connect(function() Window:Show() end))
 		Window._orb, Window._orbScale = Orb, OrbScale
-	end
-
-	-- Mostrar/ocultar con una tecla. config.ToggleKey = false/nil desactiva el atajo.
-	local toggleKey = config.ToggleKey
-	if toggleKey == nil then toggleKey = Enum.KeyCode.K end
-	if toggleKey then
-		track(UserInputService.InputBegan:Connect(function(input, gameProcessed)
-			if gameProcessed then return end
-			if input.KeyCode == toggleKey then
-				local ok, err = pcall(function() Window:Toggle() end)
-				if not ok then
-					warn("[PasteBinHub] Error al abrir/cerrar con " .. tostring(toggleKey) .. ": " .. tostring(err))
-				end
-			end
-		end))
 	end
 
 	table.insert(UI.Windows, Window)
