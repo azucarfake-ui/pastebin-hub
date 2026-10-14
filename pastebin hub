@@ -19,6 +19,10 @@
 	  • la fila de tabs se mueve ARRASTRANDO con el mouse (o el dedo);
 	  • el contenido de la pestaña con la rueda del mouse (o el dedo).
 
+	Botón X: cierra la ventana; se deshace en bloques verdes que vuelan
+	a un círculo con una calavera pixelada. Tocás el círculo (o la tecla
+	ToggleKey) y los bloques vuelven a armar la ventana.
+
 	Uso:
 		local UI = loadstring(game:HttpGet("...PasteBinHub.lua"))()
 		local Window = UI:CreateWindow({
@@ -31,6 +35,7 @@
 			Width       = 420,
 			Height      = 300,
 			Draggable   = false,      -- true = se puede mover arrastrando la barra de arriba
+			ShowOrb     = true,       -- false = al cerrar no aparece el círculo con la calavera
 			AutoSaveConfig  = true,
 			AutoLoadStagger = 0.1,
 			AutoLoadOrder   = {"M", "F", "A"},
@@ -80,6 +85,23 @@ end
 local WINDOW_W = 420
 local WINDOW_H = 300
 local TAB_STRIP_H = 28
+local ORB_SIZE    = 60  -- diámetro del círculo con la calavera
+local ORB_PIXEL   = 3   -- tamaño de cada "pixel" de la calavera
+local FX_CELL     = 28  -- tamaño de los bloques en que se deshace la ventana
+
+-- Calavera pixelada (X = pixel prendido). 11 de ancho x 10 de alto.
+local SKULL = {
+	"..XXXXXXX..",
+	".XXXXXXXXX.",
+	"XXXXXXXXXXX",
+	"XX..XXX..XX",
+	"XX..XXX..XX",
+	"XXXXX.XXXXX",
+	".XXXXXXXXX.",
+	"..XXXXXXX..",
+	"..X.X.X.X..",
+	"..XXXXXXX..",
+}
 
 local Stub = {}
 Stub.__index = function()
@@ -362,25 +384,35 @@ function UI:CreateWindow(config)
 	local TitleLabel = new("TextLabel", {
 		Text = "> " .. title .. "_", Font = Theme.Font, TextSize = 14, TextColor3 = Theme.Active,
 		TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top, TextTruncate = Enum.TextTruncate.AtEnd,
-		BackgroundTransparency = 1, Position = UDim2.new(0, 10, 0, 5), Size = UDim2.new(1, -76, 0, 18), Parent = TopBar,
+		BackgroundTransparency = 1, Position = UDim2.new(0, 10, 0, 5), Size = UDim2.new(1, -110, 0, 18), Parent = TopBar,
 	})
 	onAccent(function() if TitleLabel.Parent then TitleLabel.TextColor3 = Theme.Active end end)
 	if subtitleText ~= "" then
 		new("TextLabel", {
 			Text = "// " .. subtitleText, Font = Theme.Font, TextSize = 11, TextColor3 = Theme.TextDim,
 			TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd,
-			BackgroundTransparency = 1, Position = UDim2.new(0, 10, 0, 23), Size = UDim2.new(1, -20, 0, 14), Parent = TopBar,
+			BackgroundTransparency = 1, Position = UDim2.new(0, 10, 0, 23), Size = UDim2.new(1, -50, 0, 14), Parent = TopBar,
 		})
 	end
 	local ClockLabel = new("TextLabel", {
 		Text = os.date("%H:%M:%S"), Font = Theme.Font, TextSize = 12, TextColor3 = Theme.TextDim,
 		TextXAlignment = Enum.TextXAlignment.Right, TextYAlignment = Enum.TextYAlignment.Top, BackgroundTransparency = 1,
-		Position = UDim2.new(1, -66, 0, 6), Size = UDim2.new(0, 58, 0, 16), Parent = TopBar,
+		Position = UDim2.new(1, -96, 0, 6), Size = UDim2.new(0, 58, 0, 16), Parent = TopBar,
 	})
 	task.spawn(function() while ClockLabel.Parent do ClockLabel.Text = os.date("%H:%M:%S") task.wait(1) end end)
 	-- Línea fina bajo la barra de arriba.
 	local TopLine = new("Frame", { Size = UDim2.new(1, 0, 0, 1), Position = UDim2.new(0, 0, 1, -1), BackgroundColor3 = Theme.ActiveDim, BorderSizePixel = 0, Parent = TopBar })
 	onAccent(function() if TopLine.Parent then TopLine.BackgroundColor3 = Theme.ActiveDim end end)
+
+	-- Botón X: cierra la ventana. Se deshace en bloques que vuelan a un
+	-- círculo con una calavera pixelada; tocás el círculo y se rearma.
+	local CloseBtn = new("TextButton", {
+		Text = "X", Font = Theme.Font, TextSize = 13, TextColor3 = Theme.TextDim, AutoButtonColor = false,
+		BackgroundColor3 = Theme.Field, BorderSizePixel = 0, Size = UDim2.new(0, 24, 0, 20),
+		AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -8, 0, 5), Parent = TopBar,
+	}, { corner(4), stroke(Theme.Line, 1) })
+	CloseBtn.MouseEnter:Connect(function() CloseBtn.TextColor3 = Theme.Active tween(CloseBtn, { BackgroundColor3 = Theme.LineOpen }, 0.1) end)
+	CloseBtn.MouseLeave:Connect(function() CloseBtn.TextColor3 = Theme.TextDim tween(CloseBtn, { BackgroundColor3 = Theme.Field }, 0.1) end)
 
 	-- Fila de tabs: horizontal, sin barra de scroll. Se mueve arrastrando.
 	local TabStrip = new("ScrollingFrame", {
@@ -464,6 +496,45 @@ function UI:CreateWindow(config)
 		end))
 	end
 
+	-- Círculo con la calavera: aparece cuando se cierra la ventana. Tocarlo la reabre.
+	table.insert(Window._connections, CloseBtn.MouseButton1Click:Connect(function() Window:Hide() end))
+	if config.ShowOrb ~= false then
+		local Orb = new("Frame", {
+			Name = "Orb", Visible = false, AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0, 60, 0, 60),
+			Size = UDim2.new(0, ORB_SIZE, 0, ORB_SIZE), BackgroundColor3 = Theme.Background, BorderSizePixel = 0,
+			ZIndex = 60, Parent = ScreenGui,
+		}, { new("UICorner", { CornerRadius = UDim.new(1, 0) }) })
+		local OrbStroke = stroke(Theme.Border, 2)
+		OrbStroke.Parent = Orb
+		local OrbScale = new("UIScale", { Scale = 1, Parent = Orb })
+		local Skull = new("Frame", {
+			Size = UDim2.new(0, #SKULL[1] * ORB_PIXEL, 0, #SKULL * ORB_PIXEL), AnchorPoint = Vector2.new(0.5, 0.5),
+			Position = UDim2.new(0.5, 0, 0.5, 0), BackgroundTransparency = 1, Parent = Orb,
+		})
+		local skullPixels = {}
+		for r, rowStr in ipairs(SKULL) do
+			for c = 1, #rowStr do
+				if rowStr:sub(c, c) == "X" then
+					table.insert(skullPixels, new("Frame", {
+						Size = UDim2.new(0, ORB_PIXEL, 0, ORB_PIXEL),
+						Position = UDim2.new(0, (c - 1) * ORB_PIXEL, 0, (r - 1) * ORB_PIXEL),
+						BackgroundColor3 = Theme.Active, BorderSizePixel = 0, Parent = Skull,
+					}))
+				end
+			end
+		end
+		onAccent(function()
+			if not Orb.Parent then return end
+			OrbStroke.Color = Theme.Border
+			for _, f in ipairs(skullPixels) do f.BackgroundColor3 = Theme.Active end
+		end)
+		local OrbBtn = new("TextButton", { Text = "", AutoButtonColor = false, BackgroundTransparency = 1, Size = UDim2.new(1, 0, 1, 0), Parent = Orb })
+		OrbBtn.MouseEnter:Connect(function() if not Window._busy then tween(OrbScale, { Scale = 1.1 }, 0.1) end end)
+		OrbBtn.MouseLeave:Connect(function() if not Window._busy then tween(OrbScale, { Scale = 1 }, 0.1) end end)
+		table.insert(Window._connections, OrbBtn.MouseButton1Click:Connect(function() Window:Show() end))
+		Window._orb, Window._orbScale = Orb, OrbScale
+	end
+
 	-- Mostrar/ocultar con una tecla. config.ToggleKey = false/nil desactiva el atajo.
 	local toggleKey = config.ToggleKey
 	if toggleKey == nil then toggleKey = Enum.KeyCode.K end
@@ -505,13 +576,163 @@ function UI:CreateWindow(config)
 	return Window
 end
 
-function UI:Show()
-	self.Panel.Visible = true
-	self._visible = true
+-- ------------------------------------------------------------
+-- 	EFECTO: la ventana se deshace en bloques hacia el círculo
+-- ------------------------------------------------------------
+local function pixelColor()
+	local r = math.random()
+	if r < 0.10 then return Theme.Active end
+	if r < 0.28 then return Theme.ActiveDim end
+	if r < 0.55 then return Theme.LineOpen end
+	if r < 0.80 then return Theme.Field end
+	return Theme.Panel
 end
-function UI:Hide()
-	self.Panel.Visible = false
+
+-- closing = true: la ventana se parte en bloques que vuelan al círculo.
+-- closing = false: los bloques salen del círculo y arman la ventana.
+local function playFx(window, closing)
+	local Panel, Orb, OrbScale = window.Panel, window._orb, window._orbScale
+	local abs, size = Panel.AbsolutePosition, Panel.AbsoluteSize
+
+	local orbCenter
+	if closing then
+		-- El círculo queda arriba a la izquierda de donde estaba la ventana.
+		orbCenter = Vector2.new(abs.X + ORB_SIZE / 2 + 10, abs.Y + ORB_SIZE / 2 + 10)
+		if Orb then Orb.Position = UDim2.fromOffset(orbCenter.X, orbCenter.Y) end
+	elseif Orb then
+		orbCenter = Vector2.new(Orb.AbsolutePosition.X + ORB_SIZE / 2, Orb.AbsolutePosition.Y + ORB_SIZE / 2)
+	else
+		orbCenter = abs + size / 2
+	end
+
+	local Fx = new("Frame", {
+		Name = "Fx", Size = UDim2.new(1, 0, 1, 0), BackgroundTransparency = 1, BorderSizePixel = 0,
+		ZIndex = 55, Parent = window.ScreenGui,
+	})
+	window._fx = Fx
+
+	local cols, rows = math.ceil(size.X / FX_CELL), math.ceil(size.Y / FX_CELL)
+	local maxDist = size.Magnitude + (orbCenter - (abs + size / 2)).Magnitude
+	local pixels = {}
+	for c = 0, cols - 1 do
+		for r = 0, rows - 1 do
+			local w = math.min(FX_CELL, size.X - c * FX_CELL)
+			local h = math.min(FX_CELL, size.Y - r * FX_CELL)
+			local center = Vector2.new(abs.X + c * FX_CELL + w / 2, abs.Y + r * FX_CELL + h / 2)
+			local pix = new("Frame", {
+				AnchorPoint = Vector2.new(0.5, 0.5), Size = UDim2.fromOffset(w, h), Position = UDim2.fromOffset(center.X, center.Y),
+				BackgroundColor3 = pixelColor(), BackgroundTransparency = 1, BorderSizePixel = 0, Parent = Fx,
+			})
+			table.insert(pixels, { pix = pix, center = center, w = w, h = h, d = (center - orbCenter).Magnitude / maxDist })
+		end
+	end
+
+	local function fly(toOrb)
+		local longest = 0
+		for _, p in ipairs(pixels) do
+			local delay = p.d * 0.3 + math.random() * 0.15 -- los más cercanos al círculo primero
+			local dur = 0.4 + math.random() * 0.25
+			longest = math.max(longest, delay + dur)
+			task.delay(delay, function()
+				if not p.pix.Parent then return end
+				local goal
+				if toOrb then
+					goal = { Position = UDim2.fromOffset(orbCenter.X, orbCenter.Y), Size = UDim2.fromOffset(4, 4), BackgroundTransparency = 1 }
+				else
+					goal = { Position = UDim2.fromOffset(p.center.X, p.center.Y), Size = UDim2.fromOffset(p.w, p.h), BackgroundTransparency = 0.2 }
+				end
+				TweenService:Create(p.pix, TweenInfo.new(dur, Enum.EasingStyle.Quad, toOrb and Enum.EasingDirection.In or Enum.EasingDirection.Out), goal):Play()
+			end)
+		end
+		return longest
+	end
+
+	if closing then
+		-- 1) la ventana se "pixela": aparecen los bloques y ella se apaga
+		for _, p in ipairs(pixels) do tween(p.pix, { BackgroundTransparency = 0.2 }, 0.14) end
+		tween(Panel, { GroupTransparency = 0.7 }, 0.14)
+		task.wait(0.16)
+		Panel.Visible = false
+		Panel.GroupTransparency = Theme.Alpha
+		-- 2) los bloques se deshacen hacia el círculo
+		local longest = fly(true)
+		-- 3) el círculo con la calavera aparece cuando llegan los bloques
+		if Orb then
+			task.delay(math.max(0.15, longest * 0.45), function()
+				Orb.Visible = true
+				OrbScale.Scale = 0.2
+				tween(OrbScale, { Scale = 1 }, 0.3, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
+			end)
+		end
+		task.wait(longest + 0.05)
+	else
+		-- 1) el círculo suelta los bloques (todos arrancan desde él)
+		for _, p in ipairs(pixels) do
+			p.pix.Position = UDim2.fromOffset(orbCenter.X, orbCenter.Y)
+			p.pix.Size = UDim2.fromOffset(4, 4)
+			p.pix.BackgroundTransparency = 0.3
+		end
+		if Orb then
+			tween(OrbScale, { Scale = 0.01 }, 0.18, Enum.EasingStyle.Back, Enum.EasingDirection.In)
+			task.delay(0.2, function() Orb.Visible = false OrbScale.Scale = 1 end)
+		end
+		-- 2) vuelan a su lugar y arman la ventana
+		local longest = fly(false)
+		task.wait(longest)
+		-- 3) la ventana se enciende y los bloques se apagan
+		Panel.GroupTransparency = 0.7
+		Panel.Visible = true
+		tween(Panel, { GroupTransparency = Theme.Alpha }, 0.18)
+		for _, p in ipairs(pixels) do tween(p.pix, { BackgroundTransparency = 1 }, 0.18) end
+		task.wait(0.2)
+	end
+	Fx:Destroy()
+	window._fx = nil
+end
+
+local function clearFx(window)
+	if window._fx then
+		pcall(function() window._fx:Destroy() end)
+		window._fx = nil
+	end
+end
+
+-- Show/Hide con efecto. Show(true) / Hide(true) = instantáneo y sin círculo.
+function UI:Show(silent)
+	if self._visible or self._busy then return end
+	self._visible = true
+	if silent then
+		self.Panel.Visible = true
+		if self._orb then self._orb.Visible = false end
+		return
+	end
+	self._busy = true
+	task.spawn(function()
+		pcall(playFx, self, false)
+		clearFx(self)
+		self.Panel.GroupTransparency = Theme.Alpha
+		self.Panel.Visible = true
+		if self._orb then self._orb.Visible = false self._orbScale.Scale = 1 end
+		self._busy = false
+	end)
+end
+function UI:Hide(silent)
+	if not self._visible or self._busy then return end
 	self._visible = false
+	if silent then
+		self.Panel.Visible = false
+		if self._orb then self._orb.Visible = false end
+		return
+	end
+	self._busy = true
+	task.spawn(function()
+		pcall(playFx, self, true)
+		clearFx(self)
+		self.Panel.GroupTransparency = Theme.Alpha
+		self.Panel.Visible = false
+		if self._orb then self._orb.Visible = true self._orbScale.Scale = 1 end
+		self._busy = false
+	end)
 end
 function UI:Toggle() if self._visible then self:Hide() else self:Show() end end
 function UI:Destroy()
